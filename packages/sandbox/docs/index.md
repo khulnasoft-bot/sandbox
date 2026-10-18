@@ -1,0 +1,683 @@
+## `sandbox --help`
+
+```
+sandbox 4.8.1
+
+▲ sandbox [options] <command>
+
+For command help, run `sandbox <command> --help`
+
+Commands:
+
+    ls | list                                  List all sandboxes for the specified account and project.
+    create         [agent]                     Create a sandbox in the specified account and project.
+    sh                                         Create a sandbox and start an interactive shell
+    fork           <source>                    Fork an existing sandbox into a new one. The fork starts from the source's latest snapshot (or a fresh copy of its runtime when it has none) and copies its config (cpu, timeout, network policy, tags, env vars, etc.); any flag passed here overrides the copied value. Changes made in a running source since its last snapshot are not included: run `sandbox snapshot --stop <source>` first to fork the current filesystem.
+    config                                     View and update sandbox configuration
+    cp | copy      <src> <dst>                 Copy files between your local filesystem and a remote sandbox
+    exec           <name> <command> [...args]  Execute a command in an existing sandbox
+    ssh | connect  <name>                      Start an interactive shell in an existing sandbox
+    stop           <name> [...name]            Stop the current session of one or more sandboxes
+    extend         <name> <num UNIT>           Add time to a running session without changing its default timeout
+    rm | remove    <name> [...name]            Permanently remove one or more sandboxes
+    run            <command> [...args]         Create and run a command in a sandbox
+    snapshot       <name>                      Take a snapshot of the filesystem of a sandbox
+    snapshots                                  Manage sandbox snapshots
+    sessions                                   Manage sandbox sessions
+    drives                                     Manage sandbox drives
+    telemetry                                  Manage telemetry collection status
+    login                                      Log in to the Sandbox CLI
+    logout                                     Log out of the Sandbox CLI
+
+Examples:
+
+– Start a coding agent in a sandbox
+
+  $ sandbox create opencode
+
+– Create a sandbox on a Secure Compute network (requires an Enterprise plan)
+
+  $ sandbox create --network-id your_network_id_here
+
+– Create a sandbox and start a shell
+
+  $ sandbox sh
+
+– Run a command in a new sandbox
+
+  $ sandbox run -- node -e "console.log('hello')"
+
+– Execute command in an existing sandbox
+
+  $ sandbox exec <name> -- npm test
+```
+
+## `sandbox list`
+
+```
+list
+
+▲ sandbox list [options]
+
+List all sandboxes for the specified account and project.
+
+Flags:
+
+    --all, -a   Show all sandboxes (default shows just running) [optional]
+    --help, -h  show help [optional]
+
+Options:
+
+    --name-prefix <str>   Filter sandboxes by name prefix [optional]
+    --sort-by <value>     Sort sandboxes by field. Options: createdAt (default), name, statusUpdatedAt [optional]
+    --sort-order <value>  Sort order. Options: asc, desc (default) [optional]
+    --tag <key=value>     Filter sandboxes by tag. Format: "key=value"
+    --limit <number>      Maximum number of sandboxes per page (default 50). [optional]
+    --cursor <str>        Pagination cursor from a previous 'More results' hint. [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+```
+
+## `sandbox run`
+
+```
+run
+
+▲ sandbox run [options]
+
+Create and run a command in a sandbox
+
+Options:
+
+    --name <str>                               A user-chosen name for the sandbox. It must be unique per project. [optional]
+    --runtime <runtime>                        Deprecated. Use --image instead. [optional]
+    --image <str>                              A Khulnasoft Container Registry (KCR) image name and optional tag or sha to start the sandbox from (e.g. my-repo, my-repo:v1). [optional]
+    --timeout <num UNIT>                       The maximum duration a sandbox can run for. Example: 5m, 30m [default: 5 minutes]
+    --vcpus <COUNT>                            Number of vCPUs to allocate (each vCPU includes 2048 MB of memory) [optional]
+    --publish-port <PORT>, -p=<PORT>           Publish sandbox port(s) to DOMAIN.khulnasoft.run
+    --snapshot, -s <snapshot_id>               Start the sandbox from a snapshot ID [optional]
+    --env <key=value>, -e=<key=value>          Environment variables to set for the command
+    --tag <key=value>, -t=<key=value>          Key-value tags to associate with the sandbox (e.g. --tag env=staging)
+    --mount <drive:path[:mode]>                Attach a drive to the sandbox. Format: "drive:/path[:snapshot|read-write]".
+    --region <REGION>                          Region to create the sandbox in (defaults to iad1; any Khulnasoft region is supported, e.g. sfo1, fra1, hnd1, syd1) [optional]
+    --failover-regions <REGION,...|none>       Comma-separated regions the sandbox can fail over to (e.g. --failover-regions sfo1,fra1). Must not include the sandbox region. Pass "none" for no failover regions, overriding the project default. [optional]
+    --network-id <NETWORK_ID>                  Secure Compute network ID from your team's Settings > Networking (requires an Enterprise plan) [optional]
+    --snapshot-expiration <DURATION|none>      Default snapshot expiration. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --keep-last-snapshots <COUNT>              Keep only the N most recent snapshots of this sandbox (1-10). [optional]
+    --keep-last-snapshots-for <DURATION|none>  Expiration applied to kept snapshots. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --delete-evicted-snapshots <true|false>    When "true" (the default), evicted snapshots are deleted immediately; when "false", they keep the default expiration. [optional]
+    --network-policy <MODE>                    Network policy mode: "allow-all" or "deny-all"
+      - allow-all: sandbox can access any website/domain
+      - deny-all: sandbox has no network access
+    Omit this option and use --allowed-domain / --allowed-cidr / --denied-cidr for custom policies. [optional]
+    --allowed-domain <str>                     Domain to allow traffic to (creates a custom network policy). Supports "*" for wildcards for a segment (e.g. '*.khulnasoft.com', 'www.*.com'). If used as the first segment, will match any subdomain.
+    --allowed-cidr <str>                       CIDR to allow traffic to (creates a custom network policy). Takes precedence over 'allowed-domain'.
+    --denied-cidr <str>                        CIDR to deny traffic to (creates a custom network policy). Takes precedence over allowed domains/CIDRs.
+    --workdir, -w <str>                        The working directory to run the command in [optional]
+
+Flags:
+
+    --non-persistent     Disable automatic restore of the filesystem between sessions. [optional]
+    --silent             Don't write sandbox name to stdout [optional]
+    --connect            Start an interactive shell session after creating the sandbox [optional]
+    --sudo               Give extended privileges to the command. [optional]
+    --interactive, -i    Run the command in a secure interactive shell [optional]
+    --no-extend-timeout  Do not extend the sandbox timeout while running an interactive command. Only affects interactive executions. [optional]
+    --tty, -t            Allocate a tty for an interactive command. This is a no-op. [optional]
+    --rm                 Automatically remove the sandbox when the command exits. [optional]
+    --stop               Stop the sandbox when the command exits. [optional]
+    --help, -h           show help [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Arguments:
+
+    <command>  The executable to invoke
+    [...args]  arguments to pass to the command
+```
+
+## `sandbox create`
+
+```
+create
+
+▲ sandbox create [options]
+
+Create a sandbox in the specified account and project.
+
+Options:
+
+    --name <str>                               A user-chosen name for the sandbox. It must be unique per project. [optional]
+    --runtime <runtime>                        Deprecated. Use --image instead. [optional]
+    --image <str>                              A Khulnasoft Container Registry (KCR) image name and optional tag or sha to start the sandbox from (e.g. my-repo, my-repo:v1). [optional]
+    --timeout <num UNIT>                       The maximum duration a sandbox can run for. Example: 5m, 30m [default: 5 minutes]
+    --vcpus <COUNT>                            Number of vCPUs to allocate (each vCPU includes 2048 MB of memory) [optional]
+    --publish-port <PORT>, -p=<PORT>           Publish sandbox port(s) to DOMAIN.khulnasoft.run
+    --snapshot, -s <snapshot_id>               Start the sandbox from a snapshot ID [optional]
+    --env <key=value>, -e=<key=value>          Default environment variables for sandbox commands
+    --tag <key=value>, -t=<key=value>          Key-value tags to associate with the sandbox (e.g. --tag env=staging)
+    --mount <drive:path[:mode]>                Attach a drive to the sandbox. Format: "drive:/path[:snapshot|read-write]".
+    --region <REGION>                          Region to create the sandbox in (defaults to iad1; any Khulnasoft region is supported, e.g. sfo1, fra1, hnd1, syd1) [optional]
+    --failover-regions <REGION,...|none>       Comma-separated regions the sandbox can fail over to (e.g. --failover-regions sfo1,fra1). Must not include the sandbox region. Pass "none" for no failover regions, overriding the project default. [optional]
+    --network-id <NETWORK_ID>                  Secure Compute network ID from your team's Settings > Networking (requires an Enterprise plan) [optional]
+    --snapshot-expiration <DURATION|none>      Default snapshot expiration. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --keep-last-snapshots <COUNT>              Keep only the N most recent snapshots of this sandbox (1-10). [optional]
+    --keep-last-snapshots-for <DURATION|none>  Expiration applied to kept snapshots. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --delete-evicted-snapshots <true|false>    When "true" (the default), evicted snapshots are deleted immediately; when "false", they keep the default expiration. [optional]
+    --network-policy <MODE>                    Network policy mode: "allow-all" or "deny-all"
+      - allow-all: sandbox can access any website/domain
+      - deny-all: sandbox has no network access
+    Omit this option and use --allowed-domain / --allowed-cidr / --denied-cidr for custom policies. [optional]
+    --allowed-domain <str>                     Domain to allow traffic to (creates a custom network policy). Supports "*" for wildcards for a segment (e.g. '*.khulnasoft.com', 'www.*.com'). If used as the first segment, will match any subdomain.
+    --allowed-cidr <str>                       CIDR to allow traffic to (creates a custom network policy). Takes precedence over 'allowed-domain'.
+    --denied-cidr <str>                        CIDR to deny traffic to (creates a custom network policy). Takes precedence over allowed domains/CIDRs.
+
+Flags:
+
+    --non-persistent  Disable automatic restore of the filesystem between sessions. [optional]
+    --silent          Don't write sandbox name to stdout [optional]
+    --connect         Start an interactive shell session after creating the sandbox [optional]
+    --help, -h        show help [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Arguments:
+
+    [agent]  Open a coding agent in a new sandbox (opencode, claude, pi, codex) [optional]
+
+Examples:
+
+– Create a sandbox and open OpenCode
+
+  $ sandbox create opencode
+
+– Create a sandbox on a Secure Compute network (requires an Enterprise plan)
+
+  $ sandbox create --network-id your_network_id_here
+
+– Create and connect to a sandbox without a network access
+
+  $ sandbox run --network-policy=none --connect
+```
+
+## `sandbox sh`
+
+```
+sh
+
+▲ sandbox sh [options]
+
+Create a sandbox and start an interactive shell
+
+Options:
+
+    --name <str>                               A user-chosen name for the sandbox. It must be unique per project. [optional]
+    --runtime <runtime>                        Deprecated. Use --image instead. [optional]
+    --image <str>                              A Khulnasoft Container Registry (KCR) image name and optional tag or sha to start the sandbox from (e.g. my-repo, my-repo:v1). [optional]
+    --timeout <num UNIT>                       The maximum duration a sandbox can run for. Example: 5m, 30m [default: 5 minutes]
+    --vcpus <COUNT>                            Number of vCPUs to allocate (each vCPU includes 2048 MB of memory) [optional]
+    --publish-port <PORT>, -p=<PORT>           Publish sandbox port(s) to DOMAIN.khulnasoft.run
+    --snapshot, -s <snapshot_id>               Start the sandbox from a snapshot ID [optional]
+    --env <key=value>, -e=<key=value>          Default environment variables for sandbox commands
+    --tag <key=value>, -t=<key=value>          Key-value tags to associate with the sandbox (e.g. --tag env=staging)
+    --mount <drive:path[:mode]>                Attach a drive to the sandbox. Format: "drive:/path[:snapshot|read-write]".
+    --region <REGION>                          Region to create the sandbox in (defaults to iad1; any Khulnasoft region is supported, e.g. sfo1, fra1, hnd1, syd1) [optional]
+    --failover-regions <REGION,...|none>       Comma-separated regions the sandbox can fail over to (e.g. --failover-regions sfo1,fra1). Must not include the sandbox region. Pass "none" for no failover regions, overriding the project default. [optional]
+    --network-id <NETWORK_ID>                  Secure Compute network ID from your team's Settings > Networking (requires an Enterprise plan) [optional]
+    --snapshot-expiration <DURATION|none>      Default snapshot expiration. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --keep-last-snapshots <COUNT>              Keep only the N most recent snapshots of this sandbox (1-10). [optional]
+    --keep-last-snapshots-for <DURATION|none>  Expiration applied to kept snapshots. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --delete-evicted-snapshots <true|false>    When "true" (the default), evicted snapshots are deleted immediately; when "false", they keep the default expiration. [optional]
+    --network-policy <MODE>                    Network policy mode: "allow-all" or "deny-all"
+      - allow-all: sandbox can access any website/domain
+      - deny-all: sandbox has no network access
+    Omit this option and use --allowed-domain / --allowed-cidr / --denied-cidr for custom policies. [optional]
+    --allowed-domain <str>                     Domain to allow traffic to (creates a custom network policy). Supports "*" for wildcards for a segment (e.g. '*.khulnasoft.com', 'www.*.com'). If used as the first segment, will match any subdomain.
+    --allowed-cidr <str>                       CIDR to allow traffic to (creates a custom network policy). Takes precedence over 'allowed-domain'.
+    --denied-cidr <str>                        CIDR to deny traffic to (creates a custom network policy). Takes precedence over allowed domains/CIDRs.
+
+Flags:
+
+    --non-persistent  Disable automatic restore of the filesystem between sessions. [optional]
+    --silent          Don't write sandbox name to stdout [optional]
+    --rm              Automatically remove the sandbox when the shell exits. [optional]
+    --help, -h        show help [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+```
+
+## `sandbox fork`
+
+```
+fork
+
+▲ sandbox fork [options]
+
+Fork an existing sandbox into a new one. The fork starts from the source's latest snapshot (or a fresh copy of its runtime when it has none) and copies its config (cpu, timeout, network policy, tags, env vars, etc.); any flag passed here overrides the copied value. Changes made in a running source since its last snapshot are not included: run `sandbox snapshot --stop <source>` first to fork the current filesystem.
+
+Arguments:
+
+    <source>  Name of the source sandbox to fork from.
+
+Options:
+
+    --name <str>                               A user-chosen name for the forked sandbox. Must be unique per project. [optional]
+    --timeout <num UNIT>                       Override the maximum sandbox duration (inherited from source if omitted). Example: 5m, 30m [optional]
+    --vcpus <COUNT>                            Number of vCPUs to allocate (each vCPU includes 2048 MB of memory) [optional]
+    --publish-port <PORT>, -p=<PORT>           Publish sandbox port(s) to DOMAIN.khulnasoft.run
+    --env <key=value>, -e=<key=value>          Environment variables to set on the fork. When provided, fully replaces the env vars copied from the source (no per-key merge).
+    --tag <key=value>, -t=<key=value>          Key-value tags to associate with the fork. When provided, fully replaces the tags copied from the source (no per-key merge).
+    --region <REGION>                          Region to create the sandbox in (defaults to iad1; any Khulnasoft region is supported, e.g. sfo1, fra1, hnd1, syd1) [optional]
+    --failover-regions <REGION,...|none>       Comma-separated regions the sandbox can fail over to (e.g. --failover-regions sfo1,fra1). Must not include the sandbox region. Pass "none" for no failover regions, overriding the project default. [optional]
+    --network-id <NETWORK_ID>                  Secure Compute network ID from your team's Settings > Networking (requires an Enterprise plan) [optional]
+    --snapshot-expiration <DURATION|none>      Default snapshot expiration. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --keep-last-snapshots <COUNT>              Keep only the N most recent snapshots of this sandbox (1-10). [optional]
+    --keep-last-snapshots-for <DURATION|none>  Expiration applied to kept snapshots. Use "none" or 0 for no expiration. Example: 7d, 30d [optional]
+    --delete-evicted-snapshots <true|false>    When "true" (the default), evicted snapshots are deleted immediately; when "false", they keep the default expiration. [optional]
+    --network-policy <MODE>                    Network policy mode: "allow-all" or "deny-all"
+      - allow-all: sandbox can access any website/domain
+      - deny-all: sandbox has no network access
+    Omit this option and use --allowed-domain / --allowed-cidr / --denied-cidr for custom policies. [optional]
+    --allowed-domain <str>                     Domain to allow traffic to (creates a custom network policy). Supports "*" for wildcards for a segment (e.g. '*.khulnasoft.com', 'www.*.com'). If used as the first segment, will match any subdomain.
+    --allowed-cidr <str>                       CIDR to allow traffic to (creates a custom network policy). Takes precedence over 'allowed-domain'.
+    --denied-cidr <str>                        CIDR to deny traffic to (creates a custom network policy). Takes precedence over allowed domains/CIDRs.
+
+Flags:
+
+    --non-persistent  Disable automatic restore of the filesystem between sessions. [optional]
+    --silent          Don't write sandbox name to stdout [optional]
+    --connect         Start an interactive shell session after creating the forked sandbox [optional]
+    --help, -h        show help [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Examples:
+
+– Fork a sandbox with all config copied from the source
+
+  $ sandbox fork my-source
+
+– Fork with a specific name and overridden vcpus
+
+  $ sandbox fork my-source --name my-forked-sandbox --vcpus 4
+```
+
+## `sandbox exec`
+
+```
+exec
+
+▲ sandbox exec [options]
+
+Execute a command in an existing sandbox
+
+Arguments:
+
+    <name>     The name of the sandbox
+    <command>  The executable to invoke
+    [...args]  arguments to pass to the command
+
+Flags:
+
+    --sudo               Give extended privileges to the command. [optional]
+    --interactive, -i    Run the command in a secure interactive shell [optional]
+    --no-extend-timeout  Do not extend the sandbox timeout while running an interactive command. Only affects interactive executions. [optional]
+    --tty, -t            Allocate a tty for an interactive command. This is a no-op. [optional]
+    --help, -h           show help [optional]
+
+Options:
+
+    --workdir, -w <str>                The working directory to run the command in [optional]
+    --env <key=value>, -e=<key=value>  Environment variables to set for the command
+    --timeout <num UNIT>               Maximum duration to wait for the command (e.g. 30s, 5m). On expiry the process is killed with SIGKILL. Cannot be combined with --interactive. [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+```
+
+## `sandbox stop`
+
+```
+stop
+
+▲ sandbox stop [options]
+
+Stop the current session of one or more sandboxes
+
+Arguments:
+
+    <name>     A sandbox name to stop
+    [...name]  More sandboxes to stop
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+```
+
+## `sandbox extend`
+
+```
+extend
+
+▲ sandbox extend [options]
+
+Add time to a running session without changing its default timeout
+
+Arguments:
+
+    <name>      Sandbox name with a running session
+    <num UNIT>  Time to add, for example 5m or 1h
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+
+Examples:
+
+– Add 30 minutes
+
+  $ sandbox extend my-sandbox 30m
+```
+
+## `sandbox copy`
+
+```
+copy
+
+▲ sandbox copy [options]
+
+Copy files between your local filesystem and a remote sandbox
+
+Arguments:
+
+    <src>  The source file to copy from local file system, or a sandbox_name:path from a remote sandbox
+    <dst>  The destination file to copy to local file system, or a sandbox_name:path to a remote sandbox
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+```
+
+## `sandbox connect`
+
+```
+connect
+
+▲ sandbox connect [options]
+
+Start an interactive shell in an existing sandbox
+
+Arguments:
+
+    <name>  The name of the sandbox
+
+Flags:
+
+    --sudo               Give extended privileges to the command. [optional]
+    --no-extend-timeout  Do not extend the sandbox timeout while running an interactive command. Only affects interactive executions. [optional]
+    --help, -h           show help [optional]
+
+Options:
+
+    --workdir, -w <str>                The working directory to run the command in [optional]
+    --env <key=value>, -e=<key=value>  Environment variables to set for the command
+    --timeout <num UNIT>               Maximum duration to wait for the command (e.g. 30s, 5m). On expiry the process is killed with SIGKILL. Cannot be combined with --interactive. [optional]
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+```
+
+## `sandbox snapshot`
+
+```
+snapshot
+
+▲ sandbox snapshot [options]
+
+Take a snapshot of the filesystem of a sandbox
+
+Flags:
+
+    --stop      Confirm that the sandbox will be stopped when snapshotting [optional]
+    --silent    Don't write snapshot ID to stdout [optional]
+    --help, -h  show help [optional]
+
+Options:
+
+    --expiration <num UNIT>  The expiration time of the snapshot. Use 0 for no expiration. [optional]
+
+Arguments:
+
+    <name>  The name of the sandbox
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+```
+
+## `sandbox snapshots`
+
+```
+sandbox snapshots
+
+▲ sandbox snapshots [options] <command>
+
+For command help, run `sandbox snapshots <command> --help`
+
+Commands:
+
+    ls | list                                    List snapshots for the specified account and project.
+    get          <snapshot_id>                   Get details of a snapshot.
+    tree         <name>                          Show the snapshot ancestry tree for a sandbox.
+    rm | delete  <snapshot_id> [...snapshot_id]  Delete one or more snapshots.
+```
+
+## `sandbox drives`
+
+```
+sandbox drives
+
+▲ sandbox drives [options] <command>
+
+For command help, run `sandbox drives <command> --help`
+
+Commands:
+
+    ls | list                        List drives for the specified account and project.
+    get-or-create  <name>            Create a drive if it does not already exist, or retrieve it.
+    fork           <parent> <name>   Fork a drive with a new name, inheriting the parent drive's data, max size and region.
+    rm | delete    <name> [...name]  Delete one or more drives.
+```
+
+## `sandbox drives fork`
+
+```
+fork
+
+▲ sandbox drives fork [options]
+
+Fork a drive with a new name, inheriting the parent drive's data, max size and region.
+
+Arguments:
+
+    <parent>  Parent drive name
+    <name>    Forked drive name
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+```
+
+## `sandbox config`
+
+```
+sandbox config
+
+▲ sandbox config [options] <command>
+
+For command help, run `sandbox config <command> --help`
+
+Commands:
+
+    list                      <name>                    Display the current configuration of a sandbox
+    vcpus                     <name> <COUNT>            Update the vCPU count of a sandbox
+    timeout                   <name> <num UNIT>         Set the timeout for new sessions; a higher value extends a running session
+    persistent                <name> <true|false>       Enable or disable automatic restore of the filesystem between sessions
+    region                    <name> <REGION>           Update the region of a sandbox (will be applied to all new sessions)
+    failover-regions          <name> <REGION,...|none>  Update the failover regions of a sandbox (replaces the existing list)
+    network                   <name> <NETWORK_ID|none>  Attach or detach a sandbox's Secure Compute network (requires an Enterprise plan). Changes apply on the next session.
+    network-id                <name> <NETWORK_ID|none>  Update the Secure Compute network of a sandbox (requires an Enterprise plan)
+    mounts                    <name>                    Update the drives mounted on a sandbox (replaces all existing mounts, applied to all new sessions). Pass no --mount flag to remove them.
+    network-policy            <name>                    Update the network policy of a sandbox
+    snapshot-expiration       <name> <DURATION|none>    Update the default snapshot expiration of a sandbox
+    keep-last-snapshots       <name> <COUNT>            Update the snapshot retention policy (keep only the N most recent snapshots) of a sandbox
+    keep-last-snapshots-for   <name> <DURATION|none>    Update the expiration applied to snapshots kept by the retention policy
+    delete-evicted-snapshots  <name> <true|false>       When "true" (the default), snapshots evicted by the keep-last-snapshots policy are deleted immediately; when "false", they keep the default expiration.
+    current-snapshot          <name> <snapshot_id>      Update the current snapshot of a sandbox
+    ports                     <name>                    Update the published ports of a sandbox. Replaces all existing published ports.
+    tags                      <name>                    Update the tags of a sandbox. Replaces all existing tags with the provided tags.
+```
+
+## `sandbox config network-id`
+
+```
+network-id
+
+▲ sandbox config network-id [options]
+
+Update the Secure Compute network of a sandbox (requires an Enterprise plan)
+
+Arguments:
+
+    <name>             Sandbox name to update
+    <NETWORK_ID|none>  Secure Compute network ID (requires an Enterprise plan), or "none" to detach
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+```
+
+## `sandbox config network`
+
+```
+network
+
+▲ sandbox config network [options]
+
+Attach or detach a sandbox's Secure Compute network (requires an Enterprise plan). Changes apply on the next session.
+
+Arguments:
+
+    <name>             Sandbox name to update
+    <NETWORK_ID|none>  Secure Compute network ID (requires an Enterprise plan), or "none" to detach
+
+Auth & Scope:
+
+    --token <pat_or_oidc>   A Khulnasoft authentication token. If not provided, will use the token stored in your system from `KHULNASOFT_AUTH_TOKEN` or will start a log in process. [optional]
+    --project <my-project>  The project name or ID to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [optional]
+    --scope <my-team>       The scope/team to associate with the command. Can be inferred from KHULNASOFT_OIDC_TOKEN. [alias: --team] [optional]
+
+Flags:
+
+    --help, -h  show help [optional]
+
+Examples:
+
+– Create a sandbox on a Secure Compute network (requires an Enterprise plan)
+
+  $ sandbox create --network-id your_network_id_here
+
+– Attach or change the network for an existing sandbox (requires an Enterprise plan)
+
+  $ sandbox config network my-sandbox your_network_id_here
+
+– Detach the Secure Compute network for the next session (Enterprise only)
+
+  $ sandbox config network my-sandbox none
+```
+
+## `sandbox login`
+
+```
+login
+
+▲ sandbox login [options]
+
+Log in to the Sandbox CLI
+
+Flags:
+
+    --help, -h  show help [optional]
+```
+
+## `sandbox logout`
+
+```
+logout
+
+▲ sandbox logout [options]
+
+Log out of the Sandbox CLI
+
+Flags:
+
+    --help, -h  show help [optional]
+```

@@ -1,0 +1,209 @@
+import * as cmd from "cmd-ts";
+import { DEFAULT_SANDBOX_REGION, Sandbox } from "@khulnasoft/sandbox";
+import { sandboxClient } from "../client";
+import { scope } from "../args/scope";
+import chalk, { ChalkInstance } from "chalk";
+import ora from "ora";
+import { acquireRelease } from "../util/disposables";
+import {
+  table,
+  timeAgo,
+  formatBytes,
+  formatRunDuration,
+  formatNextCursorHint,
+} from "../util/output";
+import { ObjectFromKeyValue } from "../args/key-value-pair";
+
+function formatImage(image: string): string {
+  const [repository, digest] = image.split("@");
+  if (!digest) return image;
+  const [algorithm, hex] = digest.split(":");
+  if (!hex) return image;
+  return `${repository}@${algorithm}:${hex.slice(0, 12)}…`;
+}
+
+export const list = cmd.command({
+  name: "list",
+  aliases: ["ls"],
+  description: "List all sandboxes for the specified account and project.",
+  args: {
+    all: cmd.flag({
+      long: "all",
+      short: "a",
+      description: "Show all sandboxes (default shows just running)",
+    }),
+    namePrefix: cmd.option({
+      long: "name-prefix",
+      description: "Filter sandboxes by name prefix",
+      type: cmd.optional(cmd.string),
+    }),
+    sortBy: cmd.option({
+      long: "sort-by",
+      description:
+        "Sort sandboxes by field. Options: createdAt (default), name, statusUpdatedAt",
+      type: cmd.optional(
+        cmd.oneOf(["createdAt", "name", "statusUpdatedAt"] as const),
+      ),
+    }),
+    sortOrder: cmd.option({
+      long: "sort-order",
+      description: "Sort order. Options: asc, desc (default)",
+      type: cmd.optional(cmd.oneOf(["asc", "desc"] as const)),
+    }),
+    tags: cmd.multioption({
+      long: "tag",
+      description: 'Filter sandboxes by tag. Format: "key=value"',
+      type: ObjectFromKeyValue,
+    }),
+    limit: cmd.option({
+      long: "limit",
+      description: "Maximum number of sandboxes per page (default 50).",
+      type: cmd.optional(cmd.number),
+    }),
+    cursor: cmd.option({
+      long: "cursor",
+      description: "Pagination cursor from a previous 'More results' hint.",
+      type: cmd.optional(cmd.string),
+    }),
+    scope,
+  },
+  async handler({
+    scope: { token, team, project },
+    all,
+    namePrefix,
+    sortBy,
+    sortOrder,
+    tags,
+    limit,
+    cursor,
+  }) {
+    if (namePrefix) {
+      if (sortBy && sortBy !== "name") {
+        console.error(
+          chalk.red("Error: --sort-by must be 'name' when using --name-prefix"),
+        );
+        return;
+      }
+
+      sortBy = "name";
+    }
+
+    const { sandboxes, pagination } = await (async () => {
+      using _spinner = acquireRelease(
+        () => ora("Fetching sandboxes...").start(),
+        (s) => s.stop(),
+      );
+
+      return sandboxClient.list({
+        token,
+        teamId: team,
+        projectId: project,
+        limit: limit ?? 50,
+        ...(cursor && { cursor }),
+        ...(namePrefix && { namePrefix }),
+        ...(sortBy && { sortBy }),
+        ...(sortOrder && { sortOrder }),
+        ...(Object.keys(tags).length > 0 && { tags }),
+      });
+    })();
+
+    const displayedSandboxes = all
+      ? sandboxes
+      : sandboxes.filter((x) => x.status === "running");
+
+    const memoryFormatter = new Intl.NumberFormat(undefined, {
+      style: "unit",
+      unit: "megabyte",
+    });
+
+    type SandboxRow = (typeof sandboxes)[number];
+    type Column = {
+      value: (s: SandboxRow) => string | number;
+      color?: (s: SandboxRow) => ChalkInstance;
+    };
+
+    const columns: Record<string, Column> = {
+      NAME: { value: (s) => s.name },
+      STATUS: {
+        value: (s) => s.status,
+        color: (s) => SandboxStatusColor[s.status] ?? chalk.reset,
+      },
+      CREATED: {
+        value: (s) => timeAgo(s.createdAt),
+      },
+      // Raw list metadata, not a Sandbox instance, so the default is applied
+      // here rather than by the `region` getter.
+      REGION: { value: (s) => s.region ?? DEFAULT_SANDBOX_REGION },
+      MEMORY: {
+        value: (s) =>
+          s.memory != null ? memoryFormatter.format(s.memory) : "-",
+      },
+      VCPUS: { value: (s) => s.vcpus ?? "-" },
+      "IMAGE/RUNTIME": {
+        value: (s) => (s.image ? formatImage(s.image) : (s.runtime ?? "-")),
+      },
+      TIMEOUT: {
+        // Prefer the live deadline (`expiresAt`) of the running session. Fall
+        // back to the configured timeout for non-running sandboxes that don't
+        // report `expiresAt`.
+        value: (s) => {
+          if (s.expiresAt != null) return timeAgo(s.expiresAt);
+          if (s.timeout != null) return timeAgo(s.createdAt + s.timeout);
+          return "-";
+        },
+      },
+      SNAPSHOT: { value: (s) => s.currentSnapshotId ?? "-" },
+      MOUNTS: { value: (s) => formatMounts(s.mounts) },
+      TAGS: {
+        value: (s) =>
+          s.tags && Object.keys(s.tags).length > 0
+            ? Object.entries(s.tags)
+                .map(([k, v]) => `${k}:${v}`)
+                .join(", ")
+            : "-",
+      },
+    };
+    if (all) {
+      columns.CPU = {
+        value: (s) =>
+          s.totalActiveCpuDurationMs
+            ? formatRunDuration(s.totalActiveCpuDurationMs)
+            : "-",
+      };
+      columns["NETWORK (OUT/IN)"] = {
+        value: (s) =>
+          s.totalEgressBytes || s.totalIngressBytes
+            ? `${formatBytes(s.totalEgressBytes ?? 0)} / ${formatBytes(s.totalIngressBytes ?? 0)}`
+            : "- / -",
+      };
+    }
+
+    console.log(table({ rows: displayedSandboxes, columns }));
+
+    if (pagination.next !== null) {
+      console.log(formatNextCursorHint(pagination.next));
+    }
+  },
+});
+
+const SandboxStatusColor: Record<Sandbox["status"], ChalkInstance> = {
+  running: chalk.cyan,
+  failed: chalk.red,
+  stopped: chalk.gray.dim,
+  stopping: chalk.gray,
+  pending: chalk.magenta,
+  snapshotting: chalk.blue,
+  aborted: chalk.gray.dim,
+};
+
+function formatMounts(mounts: Sandbox["mounts"]): string {
+  if (!mounts || Object.keys(mounts).length === 0) {
+    return "-";
+  }
+
+  return Object.entries(mounts)
+    .map(
+      ([path, mount]) => `${mount.drive}:${path}:${mount.mode ?? "read-write"}`,
+    )
+    .join(", ");
+}

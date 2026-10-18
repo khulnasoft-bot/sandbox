@@ -1,0 +1,76 @@
+import { subcommands } from "cmd-ts";
+import { create } from "./commands/create";
+import { sh } from "./commands/sh";
+import { fork } from "./commands/fork";
+import { run } from "./commands/run";
+import { list } from "./commands/list";
+import { exec } from "./commands/exec";
+import { connect } from "./commands/connect";
+import { stop } from "./commands/stop";
+import { extend } from "./commands/extend";
+import { remove } from "./commands/remove";
+import { cp } from "./commands/cp";
+import { login } from "./commands/login";
+import { logout } from "./commands/logout";
+import { version } from "./pkg";
+import { snapshot } from "./commands/snapshot";
+import { snapshots } from "./commands/snapshots";
+import { sessions } from "./commands/sessions";
+import { config } from "./commands/config";
+import { drives } from "./commands/drives";
+import { telemetryCommand } from "./commands/telemetry";
+
+export const app = (opts?: { withoutAuth?: boolean; appName?: string }) => {
+  const appName = opts?.appName ?? "sandbox";
+  return subcommands({
+    name: appName,
+    description: "Interfacing with Khulnasoft Sandbox",
+    version,
+    cmds: {
+      list,
+      create,
+      sh,
+      fork,
+      config,
+      copy: cp,
+      exec,
+      connect,
+      stop,
+      extend,
+      remove,
+      run,
+      snapshot,
+      snapshots,
+      sessions,
+      drives,
+      telemetry: telemetryCommand,
+      ...(!opts?.withoutAuth && {
+        login,
+        logout,
+      }),
+    },
+    examples: [
+      {
+        description: "Start a coding agent in a sandbox",
+        command: `${appName} create opencode`,
+      },
+      {
+        description:
+          "Create a sandbox on a Secure Compute network (requires an Enterprise plan)",
+        command: `${appName} create --network-id your_network_id_here`,
+      },
+      {
+        description: "Create a sandbox and start a shell",
+        command: `${appName} sh`,
+      },
+      {
+        description: "Run a command in a new sandbox",
+        command: `${appName} run -- node -e "console.log('hello')"`,
+      },
+      {
+        description: "Execute command in an existing sandbox",
+        command: `${appName} exec <name> -- npm test`,
+      },
+    ],
+  });
+};

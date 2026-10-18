@@ -1,0 +1,1690 @@
+import { it, beforeEach, afterEach, expect, describe, vi } from "vitest";
+import { PassThrough } from "stream";
+import { consumeReadable } from "./utils/consume-readable.js";
+import { Sandbox, type SandboxMounts } from "./sandbox.js";
+import { Sandbox as SandboxSchema } from "./api-client/validators.js";
+import { Drive } from "./drive.js";
+import { Snapshot } from "./snapshot.js";
+import { APIError } from "./api-client/api-error.js";
+import type {
+  APIClient,
+  CommandData,
+  SandboxMetaData,
+  SessionMetaData,
+} from "./api-client/index.js";
+import { mkdtemp, readFile, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join, resolve } from "path";
+import ms from "ms";
+
+describe("downloadFile validation", () => {
+  it("throws when src is undefined", async () => {
+    const sandbox = new Sandbox({
+      client: {} as any,
+      routes: [],
+      session: { id: "test" } as any,
+      sandbox: { name: "test" } as any,
+      projectId: "test-project",
+    });
+    await expect(
+      sandbox.downloadFile(undefined as any, { path: "/tmp/out" }),
+    ).rejects.toThrow("downloadFile: source path is required");
+  });
+
+  it("throws when src.path is empty", async () => {
+    const sandbox = new Sandbox({
+      client: {} as any,
+      routes: [],
+      session: { id: "test" } as any,
+      sandbox: { name: "test" } as any,
+      projectId: "test-project",
+    });
+    await expect(
+      sandbox.downloadFile({ path: "" }, { path: "/tmp/out" }),
+    ).rejects.toThrow("downloadFile: source path is required");
+  });
+
+  it("throws when dst is undefined", async () => {
+    const sandbox = new Sandbox({
+      client: {} as any,
+      routes: [],
+      session: { id: "test" } as any,
+      sandbox: { name: "test" } as any,
+      projectId: "test-project",
+    });
+    await expect(
+      sandbox.downloadFile({ path: "file.txt" }, undefined as any),
+    ).rejects.toThrow("downloadFile: destination path is required");
+  });
+
+  it("throws when dst.path is empty", async () => {
+    const sandbox = new Sandbox({
+      client: {} as any,
+      routes: [],
+      session: { id: "test" } as any,
+      sandbox: { name: "test" } as any,
+      projectId: "test-project",
+    });
+    await expect(
+      sandbox.downloadFile({ path: "file.txt" }, { path: "" }),
+    ).rejects.toThrow("downloadFile: destination path is required");
+  });
+});
+
+const makeSandboxMetadata = (): SandboxMetaData => ({
+  name: "test-name",
+  currentSessionId: "sbx_123",
+  persistent: true,
+  status: "running",
+  memory: 2048,
+  vcpus: 1,
+  region: "iad1",
+  image: "khulnasoft/sandbox/universal@sha256:2c4e8f9a1b3d5e7f",
+  timeout: 300_000,
+  cwd: "/",
+  updatedAt: 1,
+  createdAt: 1,
+  snapshotExpiration: 604800000,
+});
+
+const makeCommand = (): CommandData => ({
+  id: "cmd_123",
+  name: "echo",
+  args: ["hello"],
+  cwd: "/",
+  sessionId: "sbx_123",
+  exitCode: null,
+  startedAt: 1,
+});
+
+describe("source getters", () => {
+  const makeSandbox = (overrides?: Partial<SandboxMetaData>) =>
+    new Sandbox({
+      client: {} as any,
+      routes: [],
+      session: {} as any,
+      sandbox: { ...makeSandboxMetadata(), ...overrides },
+      projectId: "test-project",
+    });
+
+  it("exposes the source image", () => {
+    const sandbox = makeSandbox();
+    expect(sandbox.image).toBe(
+      "khulnasoft/sandbox/universal@sha256:2c4e8f9a1b3d5e7f",
+    );
+  });
+
+  it("exposes a legacy runtime when present", () => {
+    const sandbox = makeSandbox({ image: undefined, runtime: "node24" });
+    expect(sandbox.runtime).toBe("node24");
+  });
+
+  it("reports the regions the API omits as the defaults", () => {
+    const sandbox = makeSandbox({
+      region: undefined,
+      failoverRegions: undefined,
+    });
+    expect(sandbox.region).toBe("iad1");
+    expect(sandbox.failoverRegions).toEqual([]);
+  });
+
+  it("exposes the regions the API reports", () => {
+    const sandbox = makeSandbox({
+      region: "sfo1",
+      failoverRegions: ["iad1", "cle1"],
+    });
+    expect(sandbox.region).toBe("sfo1");
+    expect(sandbox.failoverRegions).toEqual(["iad1", "cle1"]);
+  });
+
+  it("exposes the Secure Compute network ID", () => {
+    const sandbox = makeSandbox({ networkId: "network_123" });
+    expect(sandbox.networkId).toBe("network_123");
+  });
+});
+
+describe("update networkId", () => {
+  it.each([
+    ["sets", "network_123"],
+    ["clears", null],
+  ])("%s the Secure Compute network", async (_action, networkId) => {
+    const updateSandboxMock = vi.fn(async () => ({
+      json: { sandbox: makeSandboxMetadata() },
+    }));
+    const sandbox = new Sandbox({
+      client: { updateSandbox: updateSandboxMock } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    await sandbox.update({ networkId });
+
+    expect(updateSandboxMock).toHaveBeenCalledWith(
+      expect.objectContaining({ networkId }),
+    );
+  });
+});
+
+describe("updatePorts", () => {
+  it.each([
+    ["updatePorts", (sandbox: Sandbox) => sandbox.update({ ports: [4000] })],
+    ["update", (sandbox: Sandbox) => sandbox.update({ ports: [4000] })],
+  ])("%s sends a full port list to updateSandbox", async (_, updatePorts) => {
+    const updatedSandbox = makeSandboxMetadata();
+    const routes = [
+      {
+        url: "https://test-4000.khulnasoft.run",
+        subdomain: "test-4000",
+        port: 4000,
+      },
+    ];
+    const updateSandboxMock = vi.fn(async () => ({
+      json: { sandbox: updatedSandbox, routes },
+    }));
+    const sandbox = new Sandbox({
+      client: {
+        updateSandbox: updateSandboxMock,
+      } as unknown as APIClient,
+      routes: [
+        {
+          url: "https://test-3000.khulnasoft.run",
+          subdomain: "test-3000",
+          port: 3000,
+        },
+      ],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    await updatePorts(sandbox);
+
+    expect(updateSandboxMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "test-name",
+        projectId: "test-project",
+        ports: [4000],
+      }),
+    );
+    expect(sandbox.routes).toEqual(routes);
+    expect(sandbox.domain(4000)).toBe("https://test-4000.khulnasoft.run");
+    expect(() => sandbox.domain(3000)).toThrow("No route for port 3000");
+  });
+});
+
+describe("update timeout", () => {
+  function setup(sessionOverrides?: Partial<SandboxMetaData>) {
+    const updateSandboxMock = vi.fn(async () => ({
+      json: { sandbox: makeSandboxMetadata() },
+    }));
+    const extendTimeoutMock = vi.fn(
+      async ({ duration }: { duration: number }) => ({
+        json: {
+          session: { id: "sbx_123", status: "running", timeout: duration },
+        },
+      }),
+    );
+    const sandbox = new Sandbox({
+      client: {
+        updateSandbox: updateSandboxMock,
+        extendTimeout: extendTimeoutMock,
+      } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {
+        id: "sbx_123",
+        status: "running",
+        timeout: 300_000,
+        ...sessionOverrides,
+      } as any,
+      projectId: "test-project",
+    });
+    return { sandbox, updateSandboxMock, extendTimeoutMock };
+  }
+
+  it("extends the running session by the positive increment", async () => {
+    const { sandbox, updateSandboxMock, extendTimeoutMock } = setup();
+
+    await sandbox.update({ timeout: 600_000 });
+
+    expect(updateSandboxMock).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 600_000 }),
+    );
+    // increment = new timeout (600_000) - current session timeout (300_000)
+    expect(extendTimeoutMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "sbx_123", duration: 300_000 }),
+    );
+  });
+
+  it("does not extend the session when the new timeout is not larger", async () => {
+    const { sandbox, updateSandboxMock, extendTimeoutMock } = setup({
+      timeout: 600_000,
+    });
+
+    await sandbox.update({ timeout: 600_000 });
+
+    expect(updateSandboxMock).toHaveBeenCalled();
+    expect(extendTimeoutMock).not.toHaveBeenCalled();
+  });
+
+  it("does not extend the session when it is not running", async () => {
+    const { sandbox, updateSandboxMock, extendTimeoutMock } = setup({
+      status: "stopped",
+    });
+
+    await sandbox.update({ timeout: 600_000 });
+
+    expect(updateSandboxMock).toHaveBeenCalled();
+    expect(extendTimeoutMock).not.toHaveBeenCalled();
+  });
+
+  it("does not extend the session when timeout is not part of the update", async () => {
+    const { sandbox, extendTimeoutMock } = setup();
+
+    await sandbox.update({ persistent: false });
+
+    expect(extendTimeoutMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("expiresAt", () => {
+  it("computes the deadline from startedAt + timeout for a running session", () => {
+    const sandbox = new Sandbox({
+      client: {} as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {
+        id: "sbx_123",
+        status: "running",
+        startedAt: 1_000,
+        createdAt: 500,
+        timeout: 300_000,
+      } as any,
+      projectId: "test-project",
+    });
+
+    expect(sandbox.expiresAt).toEqual(new Date(1_000 + 300_000));
+  });
+
+  it("falls back to createdAt when the running session has no startedAt", () => {
+    const sandbox = new Sandbox({
+      client: {} as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {
+        id: "sbx_123",
+        status: "running",
+        createdAt: 500,
+        timeout: 300_000,
+      } as any,
+      projectId: "test-project",
+    });
+
+    expect(sandbox.expiresAt).toEqual(new Date(500 + 300_000));
+  });
+
+  it("falls back to the sandbox expiresAt when the session is not running", () => {
+    const sandbox = new Sandbox({
+      client: {} as unknown as APIClient,
+      routes: [],
+      sandbox: { ...makeSandboxMetadata(), expiresAt: 1_700_000_000_000 },
+      session: {
+        id: "sbx_123",
+        status: "stopped",
+        createdAt: 500,
+        timeout: 300_000,
+      } as any,
+      projectId: "test-project",
+    });
+
+    expect(sandbox.expiresAt).toEqual(new Date(1_700_000_000_000));
+  });
+
+  it("returns the sandbox expiresAt when there is no session", () => {
+    const sandbox = new Sandbox({
+      client: {} as unknown as APIClient,
+      routes: [],
+      sandbox: { ...makeSandboxMetadata(), expiresAt: 1_700_000_000_000 },
+      projectId: "test-project",
+    });
+
+    expect(sandbox.expiresAt).toEqual(new Date(1_700_000_000_000));
+  });
+
+  it("returns undefined when there is no session and no sandbox expiresAt", () => {
+    const sandbox = new Sandbox({
+      client: {} as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      projectId: "test-project",
+    });
+
+    expect(sandbox.expiresAt).toBeUndefined();
+  });
+});
+
+describe("_runCommand error handling", () => {
+  it("pipes non-detached runCommand logs from the wait stream", async () => {
+    const command = makeCommand();
+
+    const runCommandMock = vi.fn(
+      async ({
+        onLog,
+      }: {
+        onLog?: (log: { stream: "stdout" | "stderr"; data: string }) => void;
+      }) => {
+        onLog?.({ stream: "stdout", data: "hello\n" });
+        onLog?.({ stream: "stderr", data: "warning\n" });
+        return {
+          command,
+          finished: Promise.resolve({ ...command, exitCode: 0 }),
+        };
+      },
+    );
+    const getLogsMock = vi.fn();
+
+    const sandbox = new Sandbox({
+      client: {
+        runCommand: runCommandMock,
+        getLogs: getLogsMock,
+      } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let stdoutData = "";
+    let stderrData = "";
+    stdout.on("data", (chunk) => {
+      stdoutData += chunk.toString();
+    });
+    stderr.on("data", (chunk) => {
+      stderrData += chunk.toString();
+    });
+
+    const result = await sandbox.runCommand({
+      cmd: "echo",
+      args: ["hello"],
+      stdout,
+      stderr,
+    });
+
+    expect(runCommandMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wait: true,
+        logs: true,
+      }),
+    );
+    expect(getLogsMock).not.toHaveBeenCalled();
+    expect(stdoutData).toBe("hello\n");
+    expect(stderrData).toBe("warning\n");
+    await expect(result.stdout()).resolves.toBe("hello\n");
+    await expect(result.stderr()).resolves.toBe("warning\n");
+    expect(getLogsMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-detached runCommand when wait stream log streaming fails", async () => {
+    const command = makeCommand();
+    const logsError = new APIError(new Response("failed", { status: 500 }), {
+      message: "Failed to stream logs",
+      sessionId: "sbx_123",
+    });
+
+    const runCommandMock = vi.fn(async ({ wait }: { wait?: boolean }) => {
+      if (wait) {
+        return {
+          command,
+          finished: Promise.reject(logsError),
+        };
+      }
+
+      return { json: { command } };
+    });
+
+    const sandbox = new Sandbox({
+      client: {
+        runCommand: runCommandMock,
+      } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    await expect(
+      sandbox.runCommand({
+        cmd: "echo",
+        args: ["hello"],
+        stdout: new PassThrough(),
+      }),
+    ).rejects.toBe(logsError);
+  });
+
+  it("caches non-detached runCommand logs for stdout and stderr methods", async () => {
+    const command = makeCommand();
+
+    const runCommandMock = vi.fn(
+      async ({
+        onLog,
+      }: {
+        onLog?: (log: { stream: "stdout" | "stderr"; data: string }) => void;
+      }) => {
+        onLog?.({ stream: "stdout", data: "hello\n" });
+        onLog?.({ stream: "stderr", data: "warning\n" });
+        return {
+          command,
+          finished: Promise.resolve({ ...command, exitCode: 0 }),
+        };
+      },
+    );
+
+    const sandbox = new Sandbox({
+      client: {
+        runCommand: runCommandMock,
+      } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    const result = await sandbox.runCommand({ cmd: "echo", args: ["hello"] });
+
+    expect(runCommandMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wait: true,
+        logs: true,
+      }),
+    );
+    await expect(result.stdout()).resolves.toBe("hello\n");
+    await expect(result.stderr()).resolves.toBe("warning\n");
+  });
+
+  it("emits detached log streaming errors on the provided output stream", async () => {
+    const command = makeCommand();
+    const logsError = new APIError(new Response("failed", { status: 500 }), {
+      message: "Failed to stream logs",
+      sessionId: "sbx_123",
+    });
+
+    const runCommandMock = vi.fn(async ({ wait }: { wait?: boolean }) => {
+      if (wait) {
+        return {
+          command,
+          finished: Promise.resolve({ ...command, exitCode: 0 }),
+        };
+      }
+
+      return { json: { command } };
+    });
+
+    const getLogsMock = vi.fn(() =>
+      (async function* () {
+        throw logsError;
+      })(),
+    );
+
+    const sandbox = new Sandbox({
+      client: {
+        runCommand: runCommandMock,
+        getLogs: getLogsMock,
+      } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+    const stdout = new PassThrough();
+    const errorEvent = new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Expected stdout error event")),
+        100,
+      );
+      stdout.once("error", (err) => {
+        clearTimeout(timer);
+        resolve(err);
+      });
+    });
+
+    const detached = await sandbox.runCommand({
+      cmd: "echo",
+      args: ["hello"],
+      detached: true,
+      stdout,
+    });
+
+    expect(detached.cmdId).toBe("cmd_123");
+    await expect(errorEvent).resolves.toBe(logsError);
+  });
+});
+
+describe("auto-resume", () => {
+  it.each([
+    ["stopping", "sandbox_stopping"],
+    ["snapshotting", "sandbox_snapshotting"],
+  ] as const)(
+    "resumes a session that remains in %s status",
+    async (status, errorCode) => {
+      const unavailableSession: SessionMetaData = {
+        id: "sbx_123",
+        memory: 2048,
+        vcpus: 1,
+        region: "iad1",
+        timeout: 300_000,
+        status,
+        requestedAt: 1,
+        requestedStopAt: status === "stopping" ? 2 : undefined,
+        snapshottedAt: status === "snapshotting" ? 2 : undefined,
+        createdAt: 1,
+        cwd: "/",
+        updatedAt: 2,
+      };
+      const resumedSession: SessionMetaData = {
+        ...unavailableSession,
+        id: "sbx_456",
+        status: "running",
+        requestedStopAt: undefined,
+        snapshottedAt: undefined,
+      };
+      const command = { ...makeCommand(), sessionId: resumedSession.id };
+      const runCommandMock = vi
+        .fn()
+        .mockRejectedValueOnce(
+          new APIError(new Response(null, { status: 422 }), {
+            json: { error: { code: errorCode } },
+          }),
+        )
+        .mockResolvedValueOnce({
+          command,
+          finished: Promise.resolve({ ...command, exitCode: 0 }),
+        });
+      const getSandboxMock = vi.fn(async () => ({
+        json: {
+          sandbox: {
+            ...makeSandboxMetadata(),
+            currentSessionId: resumedSession.id,
+            status: "running" as const,
+          },
+          session: resumedSession,
+          routes: [],
+          resumed: true,
+        },
+      }));
+      const getSessionMock = vi.fn(async () => {
+        throw new Error("unexpected session status poll");
+      });
+      const sandbox = new Sandbox({
+        client: {
+          getSandbox: getSandboxMock,
+          getSession: getSessionMock,
+          runCommand: runCommandMock,
+        } as unknown as APIClient,
+        routes: [],
+        sandbox: { ...makeSandboxMetadata(), status },
+        session: unavailableSession,
+        projectId: "test-project",
+      });
+
+      const result = await sandbox.runCommand("echo", ["hello"]);
+
+      expect(result.exitCode).toBe(0);
+      expect(getSandboxMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "test-name",
+          projectId: "test-project",
+          resume: true,
+        }),
+      );
+      expect(getSessionMock).not.toHaveBeenCalled();
+      expect(runCommandMock).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ sessionId: "sbx_123" }),
+      );
+      expect(runCommandMock).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ sessionId: "sbx_456" }),
+      );
+    },
+  );
+});
+
+describe("runCommand timeoutMs", () => {
+  const makeRunningSandbox = (runCommandMock: ReturnType<typeof vi.fn>) =>
+    new Sandbox({
+      client: { runCommand: runCommandMock } as unknown as APIClient,
+      routes: [],
+      sandbox: makeSandboxMetadata(),
+      session: {} as any,
+      projectId: "test-project",
+    });
+
+  it("forwards timeoutMs to the API client as `timeout` on the wait path", async () => {
+    const command = makeCommand();
+    const runCommandMock = vi.fn(async () => ({
+      command,
+      finished: Promise.resolve({ ...command, exitCode: 0 }),
+    }));
+    const sandbox = makeRunningSandbox(runCommandMock);
+
+    await sandbox.runCommand({
+      cmd: "sleep",
+      args: ["60"],
+      timeoutMs: 2500,
+    });
+
+    expect(runCommandMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        wait: true,
+        timeout: 2500,
+      }),
+    );
+  });
+
+  it("omits `timeout` when no timeoutMs is provided", async () => {
+    const command = makeCommand();
+    const runCommandMock = vi.fn(async () => ({
+      command,
+      finished: Promise.resolve({ ...command, exitCode: 0 }),
+    }));
+    const sandbox = makeRunningSandbox(runCommandMock);
+
+    await sandbox.runCommand({ cmd: "echo", args: ["hello"] });
+
+    expect(runCommandMock).toHaveBeenCalledWith(
+      expect.objectContaining({ wait: true, timeout: undefined }),
+    );
+  });
+
+  it("forwards timeoutMs as `timeout` on the detached (non-wait) path", async () => {
+    const command = makeCommand();
+    const runCommandMock = vi.fn(async () => ({ json: { command } }));
+    const sandbox = makeRunningSandbox(runCommandMock);
+
+    await sandbox.runCommand({
+      cmd: "sleep",
+      args: ["5"],
+      detached: true,
+      timeoutMs: 1000,
+    });
+
+    expect(runCommandMock).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 1000 }),
+    );
+    expect(runCommandMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ wait: true }),
+    );
+  });
+});
+
+describe("Sandbox.getOrCreate", () => {
+  const CREDENTIALS = {
+    token: "test-token",
+    teamId: "team_123",
+    projectId: "proj_123",
+  };
+
+  const jsonResponse = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+
+  it("rejects runtime and image before looking up a named sandbox", async () => {
+    const mockFetch = vi.fn<typeof fetch>();
+
+    await expect(
+      Sandbox.getOrCreate({
+        ...CREDENTIALS,
+        name: "my-sandbox",
+        runtime: "node24",
+        image: "khulnasoft/sandbox/node:24",
+        fetch: mockFetch as unknown as typeof fetch,
+      } as any),
+    ).rejects.toThrow("`runtime` and `image` cannot be used together.");
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("propagates non-404 errors from Sandbox.get without attempting create", async () => {
+    // 403 is non-retryable (<500 and !=429), so it surfaces immediately.
+    const mockFetch = vi.fn<typeof fetch>(async () =>
+      jsonResponse(403, { error: { code: "forbidden", message: "nope" } }),
+    );
+    const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>();
+
+    await expect(
+      Sandbox.getOrCreate({
+        ...CREDENTIALS,
+        name: "my-sandbox",
+        fetch: mockFetch as unknown as typeof fetch,
+        onCreate,
+      }),
+    ).rejects.toBeInstanceOf(APIError);
+
+    // Only the get call should have been made — no create attempt.
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toContain("/v2/sandboxes/my-sandbox");
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+
+  it("propagates create errors when a name race occurs after a 404 from get", async () => {
+    const mockFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const method = init?.method ?? "GET";
+      if (method === "GET") {
+        return jsonResponse(404, {
+          error: { code: "not_found", message: "not found" },
+        });
+      }
+      if (method === "POST") {
+        return jsonResponse(400, {
+          error: {
+            code: "bad_request",
+            message:
+              "A sandbox with the name 'my-sandbox' already exists for this project.",
+          },
+        });
+      }
+      throw new Error(`Unexpected method ${method} to ${String(input)}`);
+    });
+    const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>();
+
+    const promise = Sandbox.getOrCreate({
+      ...CREDENTIALS,
+      name: "my-sandbox",
+      fetch: mockFetch as unknown as typeof fetch,
+      onCreate,
+    });
+
+    await expect(promise).rejects.toBeInstanceOf(APIError);
+    await expect(promise).rejects.toMatchObject({
+      response: { status: 400 },
+      json: { error: { code: "bad_request" } },
+    });
+
+    // One GET (get-sandbox 404) + one POST (create 400). onCreate must not fire.
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(onCreate).not.toHaveBeenCalled();
+  });
+});
+
+function makeMountDrive() {
+  return new Drive({
+    drive: {
+      id: "drive_123",
+      name: "my-drive",
+      projectId: "proj_123",
+      maxSizeBytes: 1024,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  });
+}
+
+const mountCases: {
+  label: string;
+  mount: SandboxMounts[string];
+  mode: "snapshot" | "read-write";
+}[] = [
+  { label: "Drive", mount: makeMountDrive(), mode: "read-write" },
+  {
+    label: "Drive snapshot",
+    mount: makeMountDrive().snapshot(),
+    mode: "snapshot",
+  },
+  {
+    label: "named read-write",
+    mount: { drive: "my-drive", mode: "read-write" },
+    mode: "read-write",
+  },
+  {
+    label: "named snapshot",
+    mount: { drive: "my-drive", mode: "snapshot" },
+    mode: "snapshot",
+  },
+];
+
+describe("Sandbox mount responses", () => {
+  it.each([
+    [{ drive: "my-drive" }, "read-write"],
+    [{ drive: "my-drive", mode: "read-only" }, "snapshot"],
+    [{ drive: "my-drive", mode: "snapshot" }, "snapshot"],
+    [{ drive: "my-drive", mode: "read-write" }, "read-write"],
+  ])("normalizes %j to %s", (mount, mode) => {
+    const sandbox = SandboxSchema.parse({
+      ...makeSandboxMetadata(),
+      mounts: { "/data": mount },
+    });
+    expect(sandbox.mounts).toEqual({ "/data": { drive: "my-drive", mode } });
+  });
+
+  it("accepts absent and empty mounts", () => {
+    expect(SandboxSchema.parse(makeSandboxMetadata()).mounts).toBeUndefined();
+    expect(
+      SandboxSchema.parse({ ...makeSandboxMetadata(), mounts: {} }).mounts,
+    ).toEqual({});
+  });
+
+  it("rejects invalid mount data", () => {
+    for (const mount of [
+      { mode: "read-write" },
+      { name: "my-drive", mode: "read-write" },
+      { drive: "my-drive", mode: "invalid" },
+    ]) {
+      expect(
+        SandboxSchema.safeParse({
+          ...makeSandboxMetadata(),
+          mounts: { "/data": mount },
+        }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("Sandbox.create mounts", () => {
+  it.each(mountCases)(
+    "sends $label mounts to the API",
+    async ({ mount, mode }) => {
+      const mockFetch = vi.fn<typeof fetch>(
+        async () =>
+          new Response(
+            JSON.stringify({
+              sandbox: makeSandboxMetadata(),
+              session: {
+                id: "sbx_123",
+                memory: 2048,
+                vcpus: 1,
+                region: "iad1",
+                runtime: "node24",
+                timeout: 300_000,
+                status: "running",
+                requestedAt: 1,
+                createdAt: 1,
+                cwd: "/",
+                updatedAt: 1,
+              },
+              routes: [],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      );
+
+      await Sandbox.create({
+        token: "test-token",
+        teamId: "team_123",
+        projectId: "proj_123",
+        name: "my-sandbox",
+        mounts: {
+          "/mnt/storage": mount,
+        },
+        fetch: mockFetch,
+      });
+
+      const [, init] = mockFetch.mock.calls[0];
+      expect(JSON.parse(String(init?.body)).mounts).toEqual({
+        "/mnt/storage": { drive: "my-drive", mode },
+      });
+    },
+  );
+});
+
+describe("Sandbox.fork mounts", () => {
+  it.each(mountCases)(
+    "sends $label mounts to the API",
+    async ({ mount, mode }) => {
+      const mockFetch = vi.fn<typeof fetch>(
+        async () =>
+          new Response(
+            JSON.stringify({
+              sandbox: makeSandboxMetadata(),
+              session: {
+                id: "sbx_123",
+                memory: 2048,
+                vcpus: 1,
+                region: "iad1",
+                runtime: "node24",
+                timeout: 300_000,
+                status: "running",
+                requestedAt: 1,
+                createdAt: 1,
+                cwd: "/",
+                updatedAt: 1,
+              },
+              routes: [],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      );
+
+      await Sandbox.fork({
+        token: "test-token",
+        teamId: "team_123",
+        projectId: "proj_123",
+        sourceSandbox: "source-sandbox",
+        mounts: {
+          "/mnt/storage": mount,
+        },
+        fetch: mockFetch,
+      });
+
+      const [, init] = mockFetch.mock.calls[0];
+      expect(JSON.parse(String(init?.body)).mounts).toEqual({
+        "/mnt/storage": { drive: "my-drive", mode },
+      });
+    },
+  );
+});
+
+describe("Sandbox.update mounts", () => {
+  it.each(mountCases)(
+    "converts $label mounts and reflects the response",
+    async ({ mount, mode }) => {
+      const mounts = { "/mnt/storage": { drive: "my-drive", mode } };
+      const updateSandboxMock = vi.fn(async () => ({
+        json: { sandbox: { ...makeSandboxMetadata(), mounts } },
+      }));
+      const sandbox = new Sandbox({
+        client: { updateSandbox: updateSandboxMock } as unknown as APIClient,
+        routes: [],
+        sandbox: makeSandboxMetadata(),
+        session: {} as any,
+        projectId: "test-project",
+      });
+
+      await sandbox.update({
+        mounts: {
+          "/mnt/storage": mount,
+        },
+      });
+
+      expect(updateSandboxMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "test-name",
+          projectId: "test-project",
+          mounts,
+        }),
+      );
+      expect(sandbox.mounts).toEqual(mounts);
+    },
+  );
+});
+
+describe("Sandbox.create environment selection", () => {
+  const CREDENTIALS = {
+    token: "test-token",
+    teamId: "team_123",
+    projectId: "proj_123",
+  };
+
+  const jsonResponse = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+
+  it("sends image in the create request body", async () => {
+    // Return a 400 so create rejects predictably; we only assert the body.
+    const mockFetch = vi.fn<typeof fetch>(async () =>
+      jsonResponse(400, { error: { code: "bad_request", message: "stop" } }),
+    );
+
+    await expect(
+      Sandbox.create({
+        ...CREDENTIALS,
+        image: "my-repo:latest",
+        fetch: mockFetch as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(APIError);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toContain("/v3/sandboxes");
+    expect(init?.method).toBe("POST");
+    const body = JSON.parse(String(init?.body));
+    expect(body.image).toBe("my-repo:latest");
+  });
+
+  it("uses the v2 endpoint when runtime is provided", async () => {
+    const mockFetch = vi.fn<typeof fetch>(async () =>
+      jsonResponse(400, { error: { code: "bad_request", message: "stop" } }),
+    );
+
+    await expect(
+      Sandbox.create({
+        ...CREDENTIALS,
+        runtime: "node24",
+        fetch: mockFetch as unknown as typeof fetch,
+      }),
+    ).rejects.toBeInstanceOf(APIError);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(String(url)).toContain("/v2/sandboxes");
+    const body = JSON.parse(String(init?.body));
+    expect(body.runtime).toBe("node24");
+  });
+
+  it("rejects runtime and image together before making a request", async () => {
+    const mockFetch = vi.fn<typeof fetch>();
+
+    await expect(
+      Sandbox.create({
+        ...CREDENTIALS,
+        runtime: "node24",
+        image: "khulnasoft/sandbox/node:24",
+        fetch: mockFetch as unknown as typeof fetch,
+      } as any),
+    ).rejects.toThrow("`runtime` and `image` cannot be used together.");
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe.skipIf(process.env.RUN_INTEGRATION_TESTS !== "1")("Sandbox", () => {
+  const PORTS = [3000, 4000];
+  const SNAPSHOT_EXPIRATION = ms("1d");
+
+  let sandbox: Sandbox;
+
+  beforeEach(async () => {
+    sandbox = await Sandbox.create({
+      ports: PORTS,
+      persistent: false,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+  });
+
+  afterEach(async () => {
+    await sandbox.delete();
+  }, 30_000);
+
+  it("allows to write files and then read them as a stream", async () => {
+    await sandbox.writeFiles([
+      { path: "hello1.txt", content: Buffer.from("Hello 1") },
+      { path: "hello2.txt", content: Buffer.from("Hello 2") },
+    ]);
+
+    const content1 = await sandbox.readFile({ path: "hello1.txt" });
+    const content2 = await sandbox.readFile({ path: "hello2.txt" });
+    expect((await consumeReadable(content1!)).toString()).toBe("Hello 1");
+    expect((await consumeReadable(content2!)).toString()).toBe("Hello 2");
+  });
+
+  it("allows to write files and then read them to a buffer", async () => {
+    await sandbox.writeFiles([
+      { path: "hello1.txt", content: Buffer.from("Hello 1") },
+      { path: "hello2.txt", content: Buffer.from("Hello 2") },
+    ]);
+
+    const content1 = await sandbox.readFileToBuffer({ path: "hello1.txt" });
+    const content2 = await sandbox.readFileToBuffer({ path: "hello2.txt" });
+    expect(content1?.toString()).toBe("Hello 1");
+    expect(content2?.toString()).toBe("Hello 2");
+  });
+
+  it("returns null when reading a non-existent file to buffer", async () => {
+    const content = await sandbox.readFileToBuffer({
+      path: "non-existent.txt",
+    });
+    expect(content).toBeNull();
+  });
+
+  it("allows downloading a file from the sandbox", async () => {
+    const fileContent = "Hello from sandbox";
+    await sandbox.writeFiles([
+      { path: "download-test.txt", content: Buffer.from(fileContent) },
+    ]);
+
+    const tmpDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
+
+    try {
+      const result = await sandbox.downloadFile(
+        { path: "download-test.txt" },
+        { path: "downloaded.txt", cwd: tmpDir },
+      );
+      expect(result).toBe(resolve(tmpDir, "downloaded.txt"));
+      expect(await readFile(result!, "utf-8")).toBe(fileContent);
+    } finally {
+      await rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it("returns null when downloading a non-existent file", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
+
+    try {
+      const result = await sandbox.downloadFile(
+        { path: "non-existent.txt" },
+        { path: "should-not-exist.txt", cwd: tmpDir },
+      );
+      expect(result).toBeNull();
+    } finally {
+      await rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it("creates parent directories when mkdirRecursive is true", async () => {
+    const fileContent = "Hello from sandbox";
+    await sandbox.writeFiles([
+      { path: "download-test.txt", content: Buffer.from(fileContent) },
+    ]);
+
+    const tmpDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
+    const nestedPath = join(tmpDir, "nested", "dir", "downloaded.txt");
+
+    try {
+      const result = await sandbox.downloadFile(
+        { path: "download-test.txt" },
+        { path: nestedPath },
+        { mkdirRecursive: true },
+      );
+      expect(result).toBe(nestedPath);
+      expect(await readFile(result!, "utf-8")).toBe(fileContent);
+    } finally {
+      await rm(tmpDir, { recursive: true });
+    }
+  });
+
+  it("verifies port forwarding works correctly", async () => {
+    const serverScript = `
+const http = require('http');
+const ports = process.argv.slice(2);
+
+for (const port of ports) {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(\`hello port \${port}\`);
+  });
+
+  server.listen(port, () => {
+    console.log(\`Server running on port \${port}\`);
+  });
+}
+`;
+
+    await sandbox.writeFiles([
+      { path: "server.js", content: Buffer.from(serverScript) },
+    ]);
+
+    const server = await sandbox.runCommand({
+      cmd: "node",
+      args: ["server.js", ...PORTS.map(String)],
+      detached: true,
+      stdout: process.stdout,
+      stderr: process.stderr,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    for (const port of PORTS) {
+      const response = await fetch(sandbox.domain(port));
+      const text = await response.text();
+      expect(text).toBe(`hello port ${port}`);
+    }
+
+    await server.kill();
+  });
+
+  it("allows extending the sandbox timeout", async () => {
+    const session = sandbox.currentSession();
+    const originalTimeout = session.timeout;
+    const extensionDuration = ms("5m");
+
+    await sandbox.extendTimeout(extensionDuration);
+    expect(session.timeout).toEqual(originalTimeout + extensionDuration);
+  });
+
+  it("auto-resumes a stopped session when running a command", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+    try {
+      await sbx.stop();
+      const result = await sbx.runCommand("echo", ["resumed!"]);
+      expect(result.exitCode).toBe(0);
+      expect(await result.stdout()).toContain("resumed!");
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("auto-resumes a stopped session when reading a file", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.writeFiles([
+        { path: "persist.txt", content: Buffer.from("persisted content") },
+      ]);
+      await sbx.stop();
+
+      const content = await sbx.readFileToBuffer({ path: "persist.txt" });
+      expect(content?.toString()).toBe("persisted content");
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("raises an error when the timeout cannot be updated", async () => {
+    try {
+      await sandbox.extendTimeout(ms("5d"));
+      expect.fail("Expected extendTimeout to throw an error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(APIError);
+      expect(error).toMatchObject({
+        response: { status: 400 },
+        json: {
+          error: { code: "sandbox_timeout_invalid" },
+        },
+      });
+    }
+  });
+
+  it("returns not found when getting a deleted sandbox", async () => {
+    const sbx = await Sandbox.create({
+      persistent: false,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+    const name = sbx.name;
+    await sbx.delete();
+
+    try {
+      await Sandbox.get({ name });
+      expect.fail("Expected Sandbox.get to throw an error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(APIError);
+      expect(error).toMatchObject({
+        response: { status: 404 },
+      });
+    }
+  });
+
+  it("lists two sessions after stop and resume", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.stop();
+
+      const resumed = await Sandbox.get({ name: sbx.name, resume: true });
+      const { sessions } = await resumed.listSessions();
+
+      expect(sessions).toHaveLength(2);
+
+      const currentSessionId = resumed.currentSession().sessionId;
+      const match = sessions.find((s) => s.id === currentSessionId);
+      expect(match).toBeDefined();
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("lists one snapshot after creating one", async () => {
+    await sandbox.snapshot();
+
+    const { snapshots } = await sandbox.listSnapshots();
+    expect(snapshots).toHaveLength(1);
+  });
+
+  it("reflects updated resources after update", async () => {
+    const sbx = await Sandbox.create({
+      timeout: 60_000,
+      persistent: true,
+      snapshotExpiration: 7 * 86400000,
+      keepLastSnapshots: { count: 3 },
+    });
+
+    try {
+      expect(sbx.snapshotExpiration).toBe(7 * 86400000);
+      expect(sbx.keepLastSnapshots).toMatchObject({
+        count: 3,
+        deleteEvicted: true,
+      });
+      await sbx.stop();
+
+      const { snapshotId } = await sbx.snapshot();
+
+      await sbx.update({
+        resources: { vcpus: 4 },
+        timeout: 30_000,
+        persistent: false,
+        snapshotExpiration: 2 * 86400000,
+        keepLastSnapshots: {
+          count: 5,
+          expiration: 3 * 86400000,
+          deleteEvicted: false,
+        },
+        currentSnapshotId: snapshotId,
+      });
+
+      const updated = await Sandbox.get({
+        name: sbx.name,
+        resume: false,
+      });
+      expect(updated.vcpus).toBe(4);
+      expect(updated.memory).toBe(8192);
+      expect(updated.timeout).toBe(30_000);
+      expect(updated.persistent).toBe(false);
+      expect(updated.snapshotExpiration).toBe(2 * 86400000);
+      expect(updated.keepLastSnapshots).toEqual({
+        count: 5,
+        expiration: 3 * 86400000,
+        deleteEvicted: false,
+      });
+      expect(updated.currentSnapshotId).toBe(snapshotId);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("clears keepLastSnapshots when updated with null", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      keepLastSnapshots: {
+        count: 2,
+        expiration: 7 * 86400000,
+        deleteEvicted: true,
+      },
+    });
+
+    try {
+      expect(sbx.keepLastSnapshots).toMatchObject({ count: 2 });
+
+      await sbx.update({ keepLastSnapshots: null });
+
+      const cleared = await Sandbox.get({
+        name: sbx.name,
+        resume: false,
+      });
+      expect(cleared.keepLastSnapshots).toBeUndefined();
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("appears in the sandbox list after creation", async () => {
+    await sandbox.stop();
+    const { sandboxes } = await Sandbox.list({
+      namePrefix: sandbox.name,
+      sortBy: "name",
+      limit: 1,
+    });
+    expect(sandboxes).toHaveLength(1);
+    expect(sandboxes[0].name).toBe(sandbox.name);
+  });
+
+  it("calls onResume when Sandbox.get resumes a stopped sandbox", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.stop();
+
+      let resumedSandbox: Sandbox | null = null;
+      const retrieved = await Sandbox.get({
+        name: sbx.name,
+        resume: true,
+        onResume: async (s) => {
+          resumedSandbox = s;
+        },
+      });
+
+      expect(resumedSandbox).toBe(retrieved);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("calls onResume on auto-resume after a stopped session", async () => {
+    let resumeCount = 0;
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+      onResume: async () => {
+        resumeCount++;
+      },
+    });
+
+    try {
+      await sbx.stop();
+      await sbx.runCommand("echo", ["hello"]);
+
+      expect(resumeCount).toBe(1);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("updates status and currentSnapshotId after stopping a persistent sandbox", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      expect(sbx.status).toBe("running");
+
+      await sbx.stop();
+
+      expect(sbx.status).toBe("stopped");
+      expect(sbx.currentSnapshotId).not.toBeNull();
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("does not call onResume when Sandbox.get does not resume", async () => {
+    let called = false;
+    await Sandbox.get({
+      name: sandbox.name,
+      resume: true,
+      onResume: async () => {
+        called = true;
+      },
+    });
+
+    expect(called).toBe(false);
+  });
+
+  it("paginates Sandbox.list across multiple pages", async () => {
+    const tag = `pagination-${Date.now()}`;
+    const [a, b] = await Promise.all([
+      Sandbox.create({
+        tags: { test: tag },
+        persistent: false,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+      }),
+      Sandbox.create({
+        tags: { test: tag },
+        persistent: false,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+      }),
+    ]);
+
+    try {
+      await Promise.all([a.stop(), b.stop()]);
+
+      const firstPage = await Sandbox.list({ limit: 1, tags: { test: tag } });
+      expect(firstPage.sandboxes).toHaveLength(1);
+      expect(firstPage.pagination.next).not.toBeNull();
+
+      const all = await firstPage.toArray();
+      expect(all).toHaveLength(2);
+      expect(new Set(all.map((s) => s.name))).toEqual(
+        new Set([a.name, b.name]),
+      );
+    } finally {
+      await Promise.all([a.delete(), b.delete()]);
+    }
+  });
+
+  it("rejects Sandbox.list with multiple tag filters at the type level", () => {
+    const check = () =>
+      Sandbox.list({
+        // @ts-expect-error — only a single tag filter is supported
+        tags: { purpose: "benchmark", execution: "execution-123" },
+      });
+    expect(check).toBeInstanceOf(Function);
+  });
+
+  it("paginates listSessions across multiple pages", async () => {
+    const sbx = await Sandbox.create({
+      persistent: true,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.stop();
+      await Sandbox.get({ name: sbx.name, resume: true });
+
+      const firstPage = await sbx.listSessions({ limit: 1 });
+      expect(firstPage.sessions).toHaveLength(1);
+      expect(firstPage.pagination.next).not.toBeNull();
+
+      const all = await firstPage.toArray();
+      expect(all).toHaveLength(2);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("paginates listSnapshots across multiple pages", async () => {
+    const sbx = await Sandbox.create({
+      persistent: false,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.snapshot();
+      await sbx.snapshot();
+
+      const firstPage = await sbx.listSnapshots({ limit: 1 });
+      expect(firstPage.snapshots).toHaveLength(1);
+      expect(firstPage.pagination.next).not.toBeNull();
+
+      const all = await firstPage.toArray();
+      expect(all).toHaveLength(2);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  it("paginates Snapshot.list across multiple pages", async () => {
+    const sbx = await Sandbox.create({
+      persistent: false,
+      snapshotExpiration: SNAPSHOT_EXPIRATION,
+    });
+
+    try {
+      await sbx.snapshot();
+      await sbx.snapshot();
+
+      const firstPage = await Snapshot.list({ name: sbx.name, limit: 1 });
+      expect(firstPage.snapshots).toHaveLength(1);
+      expect(firstPage.pagination.next).not.toBeNull();
+
+      const all = await firstPage.toArray();
+      expect(all).toHaveLength(2);
+    } finally {
+      await sbx.delete();
+    }
+  });
+
+  describe("getOrCreate", () => {
+    it("creates a new sandbox and fires onCreate when no name is provided", async () => {
+      const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>(
+        async () => {},
+      );
+      sandbox = await Sandbox.getOrCreate({
+        persistent: false,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+        onCreate,
+      });
+
+      expect(sandbox.status).toBe("running");
+      expect(onCreate).toHaveBeenCalledTimes(1);
+      expect(onCreate.mock.calls[0][0]).toBe(sandbox);
+    });
+
+    it("returns the existing sandbox without firing onCreate when the name exists", async () => {
+      const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>(
+        async () => {},
+      );
+      const fetched = await Sandbox.getOrCreate({
+        name: sandbox.name,
+        onCreate,
+      });
+
+      expect(fetched.name).toBe(sandbox.name);
+      expect(onCreate).not.toHaveBeenCalled();
+    });
+
+    it("creates a new sandbox with the given name and fires onCreate when the name does not exist", async () => {
+      const name = `goc-new-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+      const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>(
+        async () => {},
+      );
+
+      sandbox = await Sandbox.getOrCreate({
+        name,
+        persistent: false,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+        onCreate,
+      });
+
+      expect(sandbox.name).toBe(name);
+      expect(sandbox.status).toBe("running");
+      expect(onCreate).toHaveBeenCalledTimes(1);
+      expect(onCreate.mock.calls[0][0]).toBe(sandbox);
+    });
+
+    it("recreates the sandbox with the same name when the snapshot is missing", async () => {
+      // A persistent sandbox + stop() reliably creates a snapshot and
+      // updates `currentSnapshotId`. Deleting that snapshot makes the next
+      // resume fail with `snapshot_not_found`.
+      sandbox = await Sandbox.create({
+        persistent: true,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+      });
+      const name = sandbox.name;
+      const originalSessionId = sandbox.currentSession().sessionId;
+      await sandbox.stop();
+
+      const snapshotId = sandbox.currentSnapshotId;
+      expect(snapshotId).not.toBeNull();
+      const snapshot = await Snapshot.get({ snapshotId: snapshotId! });
+      await snapshot.delete();
+
+      const onCreate = vi.fn<(sandbox: Sandbox) => Promise<void>>(
+        async () => {},
+      );
+      sandbox = await Sandbox.getOrCreate({
+        name,
+        persistent: true,
+        snapshotExpiration: SNAPSHOT_EXPIRATION,
+        resume: true,
+        onCreate,
+      });
+
+      expect(sandbox.name).toBe(name);
+      expect(sandbox.currentSession().sessionId).not.toBe(originalSessionId);
+      expect(sandbox.status).toBe("running");
+      expect(onCreate).toHaveBeenCalledTimes(1);
+      expect(onCreate.mock.calls[0][0]).toBe(sandbox);
+    });
+  });
+});

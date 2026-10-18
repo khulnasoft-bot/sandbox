@@ -1,0 +1,63 @@
+{
+  "name": "@khulnasoft/sandbox-mock",
+  "version": "1.0.0",
+  "description": "Drop-in mock for @khulnasoft/sandbox backed by just-bash.",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.cjs"
+    },
+    "./proxy": {
+      "types": "./dist/proxy.d.ts",
+      "import": "./dist/proxy.js",
+      "require": "./dist/proxy.cjs",
+      "default": "./dist/proxy.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf node_modules dist",
+    "build": "tsdown",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "khulnasoft",
+    "sandbox",
+    "mock",
+    "testing"
+  ],
+  "homepage": "https://khulnasoft.com/docs/khulbasoft-sandbox/sdk-reference",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/khulnasoft/sandbox.git",
+    "directory": "packages/khulbasoft-sandbox-mock"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "just-bash": "^3.1.0",
+    "tar-stream": "3.1.7"
+  },
+  "peerDependencies": {
+    "@khulnasoft/sandbox": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.12",
+    "@types/tar-stream": "3.1.4",
+    "@khulnasoft/sandbox": "workspace:^",
+    "tsdown": "catalog:",
+    "typescript": "5.8.3",
+    "vitest": "catalog:"
+  }
+}

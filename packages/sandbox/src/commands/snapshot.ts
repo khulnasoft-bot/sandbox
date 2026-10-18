@@ -1,0 +1,82 @@
+import * as cmd from "cmd-ts";
+import { sandboxName } from "../args/sandbox-name";
+import { Sandbox } from "@khulnasoft/sandbox";
+import { scope } from "../args/scope";
+import { sandboxClient } from "../client";
+import chalk from "chalk";
+import ora from "ora";
+import { Duration } from "../types/duration";
+import ms from "ms";
+
+export const args = {
+  stop: cmd.flag({
+    long: "stop",
+    description: "Confirm that the sandbox will be stopped when snapshotting",
+  }),
+  silent: cmd.flag({
+    long: "silent",
+    description: "Don't write snapshot ID to stdout",
+  }),
+  expiration: cmd.option({
+    long: "expiration",
+    type: cmd.optional(Duration),
+    description: "The expiration time of the snapshot. Use 0 for no expiration.",
+  }),
+  sandbox: cmd.positional({
+    type: sandboxName as cmd.Type<string, string | Sandbox>,
+  }),
+  scope,
+} as const;
+
+export const snapshot = cmd.command({
+  name: "snapshot",
+  description: "Take a snapshot of the filesystem of a sandbox",
+  args,
+  async handler({
+    sandbox: sandboxName,
+    stop,
+    scope: { token, team, project },
+    silent,
+    expiration,
+  }) {
+    if (!stop) {
+      console.error(
+        [
+          "Snapshotting will stop the current session of this sandbox.",
+          `${chalk.bold("hint:")} Confirm with --stop to continue.`,
+        ].join("\n"),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const sandbox =
+      typeof sandboxName !== "string"
+        ? sandboxName
+        : await sandboxClient.get({
+            name: sandboxName,
+            projectId: project,
+            teamId: team,
+            token,
+          });
+
+    if (!["running"].includes(sandbox.status)) {
+      console.error(
+        [
+          `Sandbox ${sandbox.name} is not available (status: ${sandbox.status}).`,
+          `${chalk.bold("hint:")} Only 'running' sandboxes can be snapshotted.`,
+          "├▶ Use `sandbox list` to check sandbox status.",
+          "╰▶ Use `sandbox create` to create a new sandbox.",
+        ].join("\n"),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    const spinner = silent ? undefined : ora("Creating snapshot...").start();
+    const snapshot = await sandbox.snapshot({
+      expiration: expiration === undefined ? undefined : ms(expiration),
+    });
+    spinner?.succeed(`Snapshot ${snapshot.snapshotId} created.`);
+  },
+});

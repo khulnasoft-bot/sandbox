@@ -1,0 +1,976 @@
+import * as cmd from "cmd-ts";
+import { APIError, type Sandbox } from "@khulnasoft/sandbox";
+import { sandboxName } from "../args/sandbox-name";
+import { snapshotId } from "../args/snapshot-id";
+import { scope } from "../args/scope";
+import { sandboxClient } from "../client";
+import {
+  networkPolicyArgs,
+  networkPolicyMode as networkPolicyModeType,
+} from "../args/network-policy";
+import { buildNetworkPolicy, resolveMode } from "../util/network-policy";
+import { vcpusType } from "../args/vcpus";
+import { failoverRegionListType, regionType } from "../args/region";
+import { networkIdOrNoneType } from "../args/network-id";
+import { mounts as mountsOption } from "../args/drive";
+import { Duration } from "../types/duration";
+import { SnapshotExpiration } from "../types/snapshot-expiration";
+import { ObjectFromKeyValue } from "../args/key-value-pair";
+import { publishPorts } from "../args/ports";
+import ora from "ora";
+import chalk from "chalk";
+import ms from "ms";
+import { table } from "../util/output";
+import { acquireRelease } from "../util/disposables";
+import { StyledError } from "../error";
+
+const vcpusCommand = cmd.command({
+  name: "vcpus",
+  description: "Update the vCPU count of a sandbox",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    count: cmd.positional({
+      type: vcpusType,
+      description:
+        "Number of vCPUs to allocate (each vCPU includes 2048 MB of memory)",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, count }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ resources: { vcpus: count } });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "vcpus: " + chalk.cyan(count) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const timeoutCommand = cmd.command({
+  name: "timeout",
+  description:
+    "Set the timeout for new sessions; a higher value extends a running session",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    duration: cmd.positional({
+      type: Duration,
+      description:
+        "The maximum duration a sandbox can run for. Example: 5m, 1h",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, duration }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ timeout: ms(duration) });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "timeout: " + chalk.cyan(duration) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const persistentCommand = cmd.command({
+  name: "persistent",
+  description:
+    "Enable or disable automatic restore of the filesystem between sessions",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    value: cmd.positional({
+      type: { ...cmd.oneOf(["true", "false"]), displayName: "true|false" },
+      description:
+        "Enable or disable automatic restore of the filesystem between sessions",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, value }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ persistent: value === "true" });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "persistent: " + chalk.cyan(value) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const snapshotExpirationCommand = cmd.command({
+  name: "snapshot-expiration",
+  description: "Update the default snapshot expiration of a sandbox",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    duration: cmd.positional({
+      type: SnapshotExpiration,
+      description:
+        'Snapshot expiration duration (e.g. 7d, 30d) or "none" for no expiration',
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, duration }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ snapshotExpiration: ms(duration) });
+      spinner.stop();
+
+      const display = ms(duration) === 0 ? "none" : duration;
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "snapshot-expiration: " +
+          chalk.cyan(display) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const keepLastCountType = cmd.extendType(cmd.number, {
+  displayName: "COUNT",
+  async from(n) {
+    if (!Number.isInteger(n) || n < 0 || n > 10) {
+      throw new Error(
+        `Invalid count: ${n}. Must be an integer between 0 and 10 (0 removes the policy).`,
+      );
+    }
+    return n;
+  },
+});
+
+const keepLastSnapshotsCommand = cmd.command({
+  name: "keep-last-snapshots",
+  description:
+    "Update the snapshot retention policy (keep only the N most recent snapshots) of a sandbox",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    count: cmd.positional({
+      type: keepLastCountType,
+      description:
+        "Number of most recent snapshots to keep (1-10). Pass 0 to remove the policy.",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, count }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      if (count === 0) {
+        await sandbox.update({ keepLastSnapshots: null });
+      } else {
+        const current = sandbox.keepLastSnapshots;
+        await sandbox.update({
+          keepLastSnapshots: {
+            count,
+            expiration: current?.expiration,
+            deleteEvicted: current?.deleteEvicted,
+          },
+        });
+      }
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "keep-last-snapshots: " +
+          chalk.cyan(count === 0 ? "cleared" : `count=${count}`) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const keepLastSnapshotsForCommand = cmd.command({
+  name: "keep-last-snapshots-for",
+  description:
+    "Update the expiration applied to snapshots kept by the retention policy",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    duration: cmd.positional({
+      type: SnapshotExpiration,
+      description:
+        'Expiration for kept snapshots. Use "none" or 0 for no expiration. Example: 7d, 30d',
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, duration }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const current = sandbox.keepLastSnapshots;
+    if (!current) {
+      throw new Error(
+        [
+          "No keep-last-snapshots policy is set on this sandbox.",
+          `${chalk.bold("hint:")} Set a count first with: sandbox config keep-last-snapshots ${name} <count>`,
+        ].join("\n"),
+      );
+    }
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({
+        keepLastSnapshots: {
+          count: current.count,
+          expiration: ms(duration),
+          deleteEvicted: current.deleteEvicted,
+        },
+      });
+      spinner.stop();
+
+      const display = ms(duration) === 0 ? "none" : duration;
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "keep-last-snapshots-for: " +
+          chalk.cyan(display) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const deleteEvictedSnapshotsCommand = cmd.command({
+  name: "delete-evicted-snapshots",
+  description:
+    'When "true" (the default), snapshots evicted by the keep-last-snapshots policy are deleted immediately; when "false", they keep the default expiration.',
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    value: cmd.positional({
+      type: { ...cmd.oneOf(["true", "false"]), displayName: "true|false" },
+      description:
+        'Whether to delete evicted snapshots immediately ("true") or let them keep the default expiration ("false").',
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, value }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const current = sandbox.keepLastSnapshots;
+    if (!current) {
+      throw new Error(
+        [
+          "No keep-last-snapshots policy is set on this sandbox.",
+          `${chalk.bold("hint:")} Set a count first with: sandbox config keep-last-snapshots ${name} <count>`,
+        ].join("\n"),
+      );
+    }
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({
+        keepLastSnapshots: {
+          count: current.count,
+          expiration: current.expiration,
+          deleteEvicted: value === "true",
+        },
+      });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "delete-evicted-snapshots: " +
+          chalk.cyan(value) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const currentSnapshotCommand = cmd.command({
+  name: "current-snapshot",
+  description: "Update the current snapshot of a sandbox",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    snapshotId: cmd.positional({
+      type: snapshotId,
+      description: "Snapshot ID to set as the current snapshot",
+    }),
+    scope,
+  },
+  async handler({
+    scope: { token, team, project },
+    sandbox: name,
+    snapshotId,
+  }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ currentSnapshotId: snapshotId });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "current-snapshot: " +
+          chalk.cyan(snapshotId) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      if (error instanceof APIError && error.response.status === 404) {
+        throw new StyledError(
+          `Snapshot '${snapshotId}' was not found or does not belong to this project.`,
+          error,
+        );
+      }
+      throw error;
+    }
+  },
+});
+
+const portsCommand = cmd.command({
+  name: "ports",
+  description:
+    "Update the published ports of a sandbox. Replaces all existing published ports.",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    ports: publishPorts,
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, ports }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox ports...").start();
+    try {
+      await sandbox.update({ ports });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Ports updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      if (ports.length === 0) {
+        process.stderr.write(chalk.dim("   ╰ ") + "all ports unpublished\n");
+      } else {
+        const routes = getPublishedRoutes(sandbox);
+        process.stderr.write(chalk.dim("   │ ") + "ports:\n");
+        for (let i = 0; i < ports.length; i++) {
+          const port = ports[i];
+          const route = routes?.find((route) => route.port === port);
+          const isLast = i === ports.length - 1;
+          const prefix = isLast ? chalk.dim("   ╰ ") : chalk.dim("   │ ");
+          const url = route ? " -> " + chalk.cyan(route.url) : "";
+          process.stderr.write(prefix + "• " + port + url + "\n");
+        }
+      }
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const regionCommand = cmd.command({
+  name: "region",
+  description:
+    "Update the region of a sandbox (will be applied to all new sessions)",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    region: cmd.positional({
+      type: regionType,
+      description: "Region to run the sandbox in",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, region }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ region });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "region: " + chalk.cyan(region) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const failoverRegionsCommand = cmd.command({
+  name: "failover-regions",
+  description:
+    "Update the failover regions of a sandbox (replaces the existing list)",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    failoverRegions: cmd.positional({
+      type: failoverRegionListType,
+      description:
+        'Comma-separated regions the sandbox can fail over to (e.g. sfo1,fra1). Must not include the sandbox region. Pass "none" to remove them.',
+    }),
+    scope,
+  },
+  async handler({
+    scope: { token, team, project },
+    sandbox: name,
+    failoverRegions,
+  }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ failoverRegions });
+      spinner.stop();
+
+      const display =
+        failoverRegions.length === 0 ? "cleared" : failoverRegions.join(", ");
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "failover-regions: " + chalk.cyan(display) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const networkArgs = {
+  sandbox: cmd.positional({
+    type: sandboxName,
+    description: "Sandbox name to update",
+  }),
+  networkId: cmd.positional({
+    type: networkIdOrNoneType,
+    description:
+      'Secure Compute network ID (requires an Enterprise plan), or "none" to detach',
+  }),
+  scope,
+};
+
+const networkIdCommand = cmd.command({
+  name: "network-id",
+  description:
+    "Update the Secure Compute network of a sandbox (requires an Enterprise plan)",
+  args: networkArgs,
+  async handler({ scope: { token, team, project }, sandbox: name, networkId }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ networkId });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "network-id: " +
+          chalk.cyan(networkId ?? "cleared") +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const networkCommand = cmd.command({
+  name: "network",
+  description:
+    "Attach or detach a sandbox's Secure Compute network (requires an Enterprise plan). Changes apply on the next session.",
+  args: networkArgs,
+  handler: networkIdCommand.handler,
+  examples: [
+    {
+      description:
+        "Create a sandbox on a Secure Compute network (requires an Enterprise plan)",
+      command: "sandbox create --network-id your_network_id_here",
+    },
+    {
+      description:
+        "Attach or change the network for an existing sandbox (requires an Enterprise plan)",
+      command: "sandbox config network my-sandbox your_network_id_here",
+    },
+    {
+      description:
+        "Detach the Secure Compute network for the next session (Enterprise only)",
+      command: "sandbox config network my-sandbox none",
+    },
+  ],
+});
+
+const mountsCommand = cmd.command({
+  name: "mounts",
+  description:
+    "Update the drives mounted on a sandbox (replaces all existing mounts, applied to all new sessions). Pass no --mount flag to remove them.",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    mounts: mountsOption,
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, mounts }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const spinner = ora("Updating sandbox configuration...").start();
+    try {
+      await sandbox.update({ mounts });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Configuration updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      process.stderr.write(
+        chalk.dim("   ╰ ") +
+          "mounts: " +
+          chalk.cyan(formatMounts(mounts)) +
+          "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const listCommand = cmd.command({
+  name: "list",
+  description: "Display the current configuration of a sandbox",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to inspect",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name }) {
+    const sandbox = await (async () => {
+      using _spinner = acquireRelease(
+        () => ora("Fetching sandbox configuration...").start(),
+        (s) => s.stop(),
+      );
+      return sandboxClient.get({
+        name,
+        projectId: project,
+        teamId: team,
+        token,
+      });
+    })();
+
+    const networkPolicy =
+      typeof sandbox.networkPolicy === "string"
+        ? sandbox.networkPolicy
+        : "restricted";
+    const tagsDisplay =
+      sandbox.tags && Object.keys(sandbox.tags).length > 0
+        ? Object.entries(sandbox.tags)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ")
+        : "-";
+    const rows = [
+      { field: "Region", value: sandbox.region },
+      {
+        field: "Failover regions",
+        value: sandbox.failoverRegions.length
+          ? sandbox.failoverRegions.join(", ")
+          : "-",
+      },
+      { field: "Secure Compute network", value: sandbox.networkId ?? "-" },
+      { field: "vCPUs", value: String(sandbox.vcpus ?? "-") },
+      {
+        field: "Timeout",
+        value:
+          sandbox.timeout != null ? ms(sandbox.timeout, { long: true }) : "-",
+      },
+      { field: "Persistent", value: String(sandbox.persistent) },
+      { field: "Network policy", value: String(networkPolicy) },
+      { field: "Ports", value: formatPorts(sandbox) },
+      {
+        field: "Snapshot expiration",
+        value:
+          sandbox.snapshotExpiration != null && sandbox.snapshotExpiration > 0
+            ? ms(sandbox.snapshotExpiration, { long: true })
+            : sandbox.snapshotExpiration === 0
+              ? "none"
+              : "-",
+      },
+      {
+        field: "Keep last snapshots",
+        value: formatKeepLastSnapshots(sandbox.keepLastSnapshots),
+      },
+      { field: "Current snapshot", value: sandbox.currentSnapshotId ?? "-" },
+      { field: "Tags", value: tagsDisplay },
+      { field: "Mounts", value: formatMounts(sandbox.mounts) },
+    ];
+
+    console.log(
+      table({
+        rows,
+        columns: {
+          FIELD: { value: (r) => r.field, color: () => chalk.bold },
+          VALUE: { value: (r) => r.value },
+        },
+      }),
+    );
+  },
+});
+
+const networkPolicyCommand = cmd.command({
+  name: "network-policy",
+  description: `Update the network policy of a sandbox`,
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName as cmd.Type<string, string | Sandbox>,
+    }),
+    ...networkPolicyArgs,
+    mode: cmd.option({
+      long: "mode",
+      description: `Alias for --network-policy.`,
+      type: cmd.optional(networkPolicyModeType),
+    }),
+    scope,
+  },
+  async handler({
+    scope: { token, team, project },
+    sandbox: sandboxName,
+    networkPolicy: networkPolicyFlag,
+    mode: modeFlag,
+    allowedDomains,
+    allowedCIDRs,
+    deniedCIDRs,
+  }) {
+    const networkPolicyMode = resolveMode(networkPolicyFlag, modeFlag);
+
+    if (
+      networkPolicyMode === undefined &&
+      allowedDomains.length === 0 &&
+      allowedCIDRs.length === 0 &&
+      deniedCIDRs.length === 0
+    ) {
+      throw new Error(`Network policy mode or custom rules must be set.`);
+    }
+
+    const networkPolicy = buildNetworkPolicy({
+      networkPolicy: networkPolicyMode,
+      allowedDomains,
+      allowedCIDRs,
+      deniedCIDRs,
+    });
+
+    const sandbox =
+      typeof sandboxName !== "string"
+        ? sandboxName
+        : await sandboxClient.get({
+            name: sandboxName,
+            projectId: project,
+            teamId: team,
+            token,
+          });
+
+    const spinner = ora("Updating network policy...").start();
+    try {
+      await sandbox.update({ networkPolicy });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Network policy updated for sandbox " +
+          chalk.cyan(sandbox.name) +
+          "\n",
+      );
+      const mode =
+        typeof networkPolicy === "string" ? networkPolicy : "restricted";
+      process.stderr.write(
+        chalk.dim("   ╰ ") + "mode: " + chalk.cyan(mode) + "\n",
+      );
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+const tagsCommand = cmd.command({
+  name: "tags",
+  description:
+    "Update the tags of a sandbox. Replaces all existing tags with the provided tags.",
+  args: {
+    sandbox: cmd.positional({
+      type: sandboxName,
+      description: "Sandbox name to update",
+    }),
+    tags: cmd.multioption({
+      long: "tag",
+      short: "t",
+      type: ObjectFromKeyValue,
+      description:
+        "Key-value tags to set (e.g. --tag env=staging). Omit to clear all tags.",
+    }),
+    scope,
+  },
+  async handler({ scope: { token, team, project }, sandbox: name, tags }) {
+    const sandbox = await sandboxClient.get({
+      name,
+      projectId: project,
+      teamId: team,
+      token,
+    });
+
+    const tagsObj = Object.keys(tags).length > 0 ? tags : {};
+
+    const spinner = ora("Updating sandbox tags...").start();
+    try {
+      await sandbox.update({ tags: tagsObj });
+      spinner.stop();
+
+      process.stderr.write(
+        "✅ Tags updated for sandbox " + chalk.cyan(name) + "\n",
+      );
+      const entries = Object.entries(tagsObj);
+      if (entries.length === 0) {
+        process.stderr.write(chalk.dim("   ╰ ") + "all tags cleared\n");
+      } else {
+        for (let i = 0; i < entries.length; i++) {
+          const [k, v] = entries[i];
+          const isLast = i === entries.length - 1;
+          const prefix = isLast ? chalk.dim("   ╰ ") : chalk.dim("   │ ");
+          process.stderr.write(
+            prefix + chalk.cyan(k) + "=" + chalk.cyan(v) + "\n",
+          );
+        }
+      }
+    } catch (error) {
+      spinner.stop();
+      throw error;
+    }
+  },
+});
+
+function formatKeepLastSnapshots(
+  keepLastSnapshots:
+    | { count: number; expiration?: number; deleteEvicted?: boolean }
+    | undefined,
+): string {
+  if (!keepLastSnapshots) {
+    return "-";
+  }
+
+  const parts = [`count=${keepLastSnapshots.count}`];
+  if (keepLastSnapshots.expiration !== undefined) {
+    parts.push(
+      `for=${keepLastSnapshots.expiration === 0 ? "none" : ms(keepLastSnapshots.expiration, { long: true })}`,
+    );
+  }
+  if (keepLastSnapshots.deleteEvicted !== undefined) {
+    parts.push(`delete-evicted-snapshots=${keepLastSnapshots.deleteEvicted}`);
+  }
+
+  return parts.join(", ");
+}
+
+function formatMounts(mounts: Sandbox["mounts"]): string {
+  const entries = Object.entries(mounts ?? {});
+  if (entries.length === 0) {
+    return "-";
+  }
+  return entries
+    .map(
+      ([path, { drive, mode }]) => `${drive}:${path}:${mode ?? "read-write"}`,
+    )
+    .join(", ");
+}
+
+function formatPorts(sandbox: Sandbox): string {
+  const ports = getPublishedRoutes(sandbox)?.map((route) => route.port) ?? [];
+
+  if (ports.length === 0) {
+    return "-";
+  }
+
+  return ports.join(", ");
+}
+
+function getPublishedRoutes(sandbox: Sandbox): Sandbox["routes"] | undefined {
+  return sandbox.routes.filter(
+    (route) => route.port !== sandbox.interactivePort,
+  );
+}
+
+export const config = cmd.subcommands({
+  name: "config",
+  description: "View and update sandbox configuration",
+  cmds: {
+    list: listCommand,
+    vcpus: vcpusCommand,
+    timeout: timeoutCommand,
+    persistent: persistentCommand,
+    region: regionCommand,
+    "failover-regions": failoverRegionsCommand,
+    network: networkCommand,
+    "network-id": networkIdCommand,
+    mounts: mountsCommand,
+    "network-policy": networkPolicyCommand,
+    "snapshot-expiration": snapshotExpirationCommand,
+    "keep-last-snapshots": keepLastSnapshotsCommand,
+    "keep-last-snapshots-for": keepLastSnapshotsForCommand,
+    "delete-evicted-snapshots": deleteEvictedSnapshotsCommand,
+    "current-snapshot": currentSnapshotCommand,
+    ports: portsCommand,
+    tags: tagsCommand,
+  },
+});

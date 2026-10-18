@@ -1,0 +1,38 @@
+import { describe, expect, test } from "vitest";
+import * as real from "@khulnasoft/sandbox";
+import * as mock from "../src/index";
+import * as realProxy from "@khulnasoft/sandbox/proxy";
+import * as mockProxy from "../src/proxy";
+import {
+  Drive as RealDrive,
+  Sandbox as RealSandbox,
+  Snapshot as RealSnapshot,
+} from "@khulnasoft/sandbox";
+
+describe("public exports", () => {
+  test("re-exports every value the real SDK exposes", () => {
+    const realValues = Object.keys(real).filter(
+      (key) => typeof (real as Record<string, unknown>)[key] !== "undefined",
+    );
+    for (const name of realValues) {
+      expect(mock, `missing export: ${name}`).toHaveProperty(name);
+    }
+  });
+
+  test("adds the mock-specific stubbing helpers", () => {
+    expect(typeof mock.command).toBe("function");
+    expect(typeof mock.setupSandbox).toBe("function");
+  });
+
+  test("the ./proxy entry point re-exports the real proxy surface", () => {
+    for (const name of Object.keys(realProxy)) {
+      expect(mockProxy, `missing proxy export: ${name}`).toHaveProperty(name);
+    }
+  });
+
+  test("mock classes are drop-in subclasses of the real classes", () => {
+    expect(mock.Drive.prototype).toBeInstanceOf(RealDrive);
+    expect(mock.Sandbox.prototype).toBeInstanceOf(RealSandbox);
+    expect(mock.Snapshot.prototype).toBeInstanceOf(RealSnapshot);
+  });
+});

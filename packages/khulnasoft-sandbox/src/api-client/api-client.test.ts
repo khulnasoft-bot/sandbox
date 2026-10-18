@@ -1,0 +1,2577 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { APIClient } from "./api-client.js";
+import { APIError, StreamError } from "./api-error.js";
+import { createNdjsonStream } from "../../test-utils/mock-response.js";
+import { z } from "zod";
+
+describe("APIClient", () => {
+  describe("getLogs", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("yields stdout log lines", async () => {
+      const logLines = [
+        { stream: "stdout", data: "hello" },
+        { stream: "stdout", data: "world" },
+      ];
+
+      mockFetch.mockResolvedValue(
+        new Response(createNdjsonStream(logLines), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+      const results: Array<{ stream: string; data: string }> = [];
+
+      for await (const log of logs) {
+        results.push(log);
+      }
+
+      expect(results).toHaveLength(2);
+      expect(results[0]).toEqual({ stream: "stdout", data: "hello" });
+      expect(results[1]).toEqual({ stream: "stdout", data: "world" });
+    });
+
+    it("yields stderr log lines", async () => {
+      const logLines = [{ stream: "stderr", data: "Error" }];
+
+      mockFetch.mockResolvedValue(
+        new Response(createNdjsonStream(logLines), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+      const results: Array<{ stream: string; data: string }> = [];
+
+      for await (const log of logs) {
+        results.push(log);
+      }
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toEqual({
+        stream: "stderr",
+        data: "Error",
+      });
+    });
+
+    it("throws APIError when content-type is not application/x-ndjson", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(null, {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+
+      await expect(async () => {
+        for await (const _ of logs) {
+        }
+      }).rejects.toThrow(APIError);
+    });
+
+    it("throws APIError when response status is not ok", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ error: "gone" }), {
+          status: 410,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+
+      try {
+        for await (const _ of logs) {
+        }
+        expect.fail("Expected APIError to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(APIError);
+        expect(err.message).toBe("Status code 410 is not ok");
+        expect(err.json).toEqual({
+          error: "gone",
+        });
+      }
+    });
+
+    it("throws APIError when response body is null", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(null, {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+
+      await expect(async () => {
+        for await (const _ of logs) {
+        }
+      }).rejects.toThrow(APIError);
+    });
+
+    it("throws StreamError when error log line is received", async () => {
+      const logLines = [
+        { stream: "stdout", data: "some logs" },
+        {
+          stream: "error",
+          data: {
+            code: "sandbox_stream_closed",
+            message: "Sandbox stream was closed and is not accepting commands.",
+          },
+        },
+      ];
+
+      mockFetch.mockResolvedValue(
+        new Response(createNdjsonStream(logLines), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+      const results: Array<{ stream: string; data: string }> = [];
+
+      await expect(async () => {
+        for await (const log of logs) {
+          results.push(log);
+        }
+      }).rejects.toThrow(StreamError);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toEqual({ stream: "stdout", data: "some logs" });
+    });
+
+    it("includes sessionId in APIError", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(null, {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+
+      try {
+        for await (const _ of logs) {
+        }
+        expect.fail("Expected APIError to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(APIError);
+        expect((err as APIError<unknown>).sessionId).toBe("sbx_123");
+      }
+    });
+
+    it("includes sessionId in StreamError", async () => {
+      const logLines = [
+        {
+          stream: "error",
+          data: {
+            code: "sandbox_stopped",
+            message: "Sandbox has stopped",
+          },
+        },
+      ];
+
+      mockFetch.mockResolvedValue(
+        new Response(createNdjsonStream(logLines), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_456" });
+
+      try {
+        for await (const _ of logs) {
+        }
+        expect.fail("Expected StreamError to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(StreamError);
+        expect((err as StreamError).sessionId).toBe("sbx_123");
+      }
+    });
+  });
+
+  describe("runCommand", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("streams command data when wait is true", async () => {
+      const first = {
+        command: {
+          id: "cmd_123",
+          name: "echo",
+          args: ["hello"],
+          cwd: "/",
+          sessionId: "sbx_123",
+          exitCode: null,
+          startedAt: 1,
+        },
+      };
+      const second = {
+        command: {
+          ...first.command,
+          exitCode: 0,
+          durationMs: 1234,
+        },
+      };
+
+      mockFetch.mockResolvedValue(
+        new Response(createNdjsonStream([first, second]), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const result = await client.runCommand({
+        sessionId: "sbx_123",
+        command: "echo",
+        args: ["hello"],
+        env: {},
+        sudo: false,
+        wait: true,
+      });
+
+      expect(result.command.exitCode).toBeNull();
+      await expect(result.finished).resolves.toMatchObject({
+        exitCode: 0,
+        durationMs: 1234,
+      });
+    });
+
+    it("calls onLog for logs between command data when logs and wait are true", async () => {
+      const first = {
+        command: {
+          id: "cmd_123",
+          name: "echo",
+          args: ["hello"],
+          cwd: "/",
+          sessionId: "sbx_123",
+          exitCode: null,
+          startedAt: 1,
+        },
+      };
+      const second = {
+        command: {
+          ...first.command,
+          exitCode: 0,
+          durationMs: 1234,
+        },
+      };
+
+      mockFetch.mockResolvedValue(
+        new Response(
+          createNdjsonStream([
+            first,
+            { stream: "stdout", data: "hello\n" },
+            { stream: "stderr", data: "warning\n" },
+            second,
+          ]),
+          {
+            headers: { "content-type": "application/x-ndjson" },
+          },
+        ),
+      );
+
+      const logLines = [];
+      const result = await client.runCommand({
+        sessionId: "sbx_123",
+        command: "echo",
+        args: ["hello"],
+        env: {},
+        sudo: false,
+        wait: true,
+        logs: true,
+        onLog: (log) => logLines.push(log),
+      });
+
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toMatchObject({
+        wait: true,
+        logs: true,
+      });
+      await expect(result.finished).resolves.toMatchObject({
+        exitCode: 0,
+        durationMs: 1234,
+      });
+      expect(logLines).toEqual([
+        { stream: "stdout", data: "hello\n" },
+        { stream: "stderr", data: "warning\n" },
+      ]);
+    });
+
+    it("sends attachStdin for detached commands", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            command: {
+              id: "cmd_123",
+              name: "cat",
+              args: [],
+              cwd: "/",
+              sessionId: "sbx_123",
+              exitCode: null,
+              startedAt: 1,
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+
+      await client.runCommand({
+        sessionId: "sbx_123",
+        command: "cat",
+        args: [],
+        env: {},
+        sudo: false,
+        attachStdin: true,
+      });
+
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toMatchObject({
+        attachStdin: true,
+      });
+    });
+
+    it("throws APIError when response status is not ok", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ error: "gone" }), {
+          status: 410,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      try {
+        await client.runCommand({
+          sessionId: "sbx_123",
+          command: "echo",
+          args: ["hello"],
+          env: {},
+          sudo: false,
+          wait: true,
+        });
+        expect.fail("Expected APIError to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(APIError);
+        expect(err.message).toBe("Status code 410 is not ok");
+        expect(err.json).toEqual({
+          error: "gone",
+        });
+      }
+    });
+
+    it("surfaces the server's error message in APIError.message", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "bad_request",
+              message:
+                "Invalid request: `ports` should NOT have more than 15 items.",
+            },
+          }),
+          {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+
+      try {
+        await client.runCommand({
+          sessionId: "sbx_123",
+          command: "echo",
+          args: ["hello"],
+          env: {},
+          sudo: false,
+          wait: true,
+        });
+        expect.fail("Expected APIError to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(APIError);
+        expect(err.message).toBe(
+          "Status code 400 is not ok: Invalid request: `ports` should NOT have more than 15 items.",
+        );
+        expect(err.json).toEqual({
+          error: {
+            code: "bad_request",
+            message:
+              "Invalid request: `ports` should NOT have more than 15 items.",
+          },
+        });
+      }
+    });
+
+    it("throws abort error (not Zod error) when signal aborts before stream finishes", async () => {
+      const commandData = {
+        command: {
+          id: "cmd_123",
+          name: "python3",
+          args: ["script.py"],
+          cwd: "/",
+          sessionId: "sbx_123",
+          exitCode: null,
+          startedAt: 1,
+        },
+      };
+
+      const encoder = new TextEncoder();
+      const firstChunk = JSON.stringify(commandData) + "\n";
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(firstChunk));
+        },
+        cancel() {},
+      });
+
+      mockFetch.mockResolvedValue(
+        new Response(stream, {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const controller = new AbortController();
+      const result = await client.runCommand({
+        sessionId: "sbx_123",
+        command: "python3",
+        args: ["script.py"],
+        env: {},
+        sudo: false,
+        wait: true,
+        signal: controller.signal,
+      });
+
+      expect(result.command.id).toBe("cmd_123");
+
+      controller.abort();
+
+      await expect(result.finished).rejects.toThrow();
+      await expect(result.finished).rejects.not.toBeInstanceOf(z.ZodError);
+    }, 10000);
+
+    it("recovers when stream closes before finished chunk arrives", async () => {
+      const commandData = {
+        command: {
+          id: "cmd_123",
+          name: "python3",
+          args: ["script.py"],
+          cwd: "/",
+          sessionId: "sbx_123",
+          exitCode: null,
+          startedAt: 1,
+        },
+      };
+
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(JSON.stringify(commandData) + "\n"),
+          );
+          controller.close();
+        },
+      });
+
+      mockFetch
+        .mockResolvedValueOnce(
+          new Response(stream, {
+            headers: { "content-type": "application/x-ndjson" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              command: {
+                ...commandData.command,
+                exitCode: 0,
+                durationMs: 1234,
+              },
+            }),
+          ),
+        );
+
+      const result = await client.runCommand({
+        sessionId: "sbx_123",
+        command: "python3",
+        args: ["script.py"],
+        env: {},
+        sudo: false,
+        wait: true,
+      });
+
+      expect(result.command.id).toBe("cmd_123");
+
+      await expect(result.finished).resolves.toMatchObject({ exitCode: 0 });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[1][0]).toContain("/cmd/cmd_123?");
+      expect(mockFetch.mock.calls[1][0]).toContain("wait=true");
+      expect(mockFetch.mock.calls[1][1].method).toBe("GET");
+    });
+
+    it("rejects when signal is already aborted before stream starts", async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start() {},
+        cancel() {},
+      });
+
+      mockFetch.mockResolvedValue(
+        new Response(stream, {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        client.runCommand({
+          sessionId: "sbx_123",
+          command: "python3",
+          args: ["script.py"],
+          env: {},
+          sudo: false,
+          wait: true,
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow();
+    });
+  });
+
+  describe("connection recovery", () => {
+    const command = {
+      id: "cmd_123",
+      name: "echo",
+      args: ["hello"],
+      cwd: "/",
+      sessionId: "sbx_123",
+      exitCode: null,
+      startedAt: 1,
+    };
+    const finished = { ...command, exitCode: 0, durationMs: 1234 };
+    const params = {
+      sessionId: "sbx_123",
+      command: "echo",
+      args: ["hello"],
+      env: {},
+      sudo: false,
+      wait: true as const,
+    };
+    let mockFetch: ReturnType<typeof vi.fn>;
+    let client: APIClient;
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    function response(lines: object[], broken = false) {
+      let sent = false;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (!sent) {
+              sent = true;
+              controller.enqueue(
+                new TextEncoder().encode(
+                  lines.map((line) => JSON.stringify(line) + "\n").join(""),
+                ),
+              );
+            } else if (broken) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              controller.error(new TypeError("terminated"));
+            } else {
+              controller.close();
+            }
+          },
+        }),
+        { headers: { "content-type": "application/x-ndjson" } },
+      );
+    }
+
+    function truncatedResponse(lines: object[]) {
+      let sent = false;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (!sent) {
+              sent = true;
+              controller.enqueue(
+                new TextEncoder().encode(
+                  lines.map((line) => JSON.stringify(line) + "\n").join("") +
+                    '{"stream":"stdout","data":"unfinished',
+                ),
+              );
+            } else {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              controller.close();
+            }
+          },
+        }),
+        { headers: { "content-type": "application/x-ndjson" } },
+      );
+    }
+
+    function bytewiseResponse(lines: object[], broken = false) {
+      const bytes = new TextEncoder().encode(
+        lines.map((line) => JSON.stringify(line) + "\n").join(""),
+      );
+      let offset = 0;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (offset < bytes.length) {
+              controller.enqueue(bytes.subarray(offset, offset + 1));
+              offset++;
+            } else if (broken) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+              controller.error(new TypeError("terminated"));
+            } else {
+              controller.close();
+            }
+          },
+        }),
+        { headers: { "content-type": "application/x-ndjson" } },
+      );
+    }
+
+    it("preserves split UTF-8 characters and replay offsets in command streams", async () => {
+      const onLog = vi.fn();
+      mockFetch
+        .mockResolvedValueOnce(
+          bytewiseResponse(
+            [
+              { command },
+              { stream: "stdout", data: "é😀" },
+              { stream: "stderr", data: "中文" },
+            ],
+            true,
+          ),
+        )
+        .mockResolvedValueOnce(
+          response([
+            { stream: "stdout", data: "é😀Z" },
+            { stream: "stderr", data: "中文!" },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      const result = await client.runCommand({ ...params, logs: true, onLog });
+      await expect(result.finished).resolves.toEqual(finished);
+      expect(onLog.mock.calls.map(([log]) => log)).toEqual([
+        { stream: "stdout", data: "é😀" },
+        { stream: "stderr", data: "中文" },
+        { stream: "stdout", data: "Z" },
+        { stream: "stderr", data: "!" },
+      ]);
+    });
+
+    it("preserves split UTF-8 characters and replay offsets in log streams", async () => {
+      mockFetch
+        .mockResolvedValueOnce(
+          bytewiseResponse([{ stream: "stdout", data: "é😀" }], true),
+        )
+        .mockResolvedValueOnce(response([{ stream: "stdout", data: "é😀Z" }]));
+      const output = [];
+      for await (const log of client.getLogs({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+      }))
+        output.push(log.data);
+      expect(output).toEqual(["é😀", "Z"]);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("recovers when a command stream ends halfway through a record", async () => {
+      const onLog = vi.fn();
+      mockFetch
+        .mockResolvedValueOnce(
+          truncatedResponse([{ command }, { stream: "stdout", data: "one" }]),
+        )
+        .mockResolvedValueOnce(
+          response([{ stream: "stdout", data: "one two" }]),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      const result = await client.runCommand({ ...params, logs: true, onLog });
+      await expect(result.finished).resolves.toEqual(finished);
+      expect(onLog.mock.calls.map(([log]) => log.data).join("")).toBe(
+        "one two",
+      );
+      expect(mockFetch.mock.calls.map((call) => call[1].method)).toEqual([
+        "POST",
+        "GET",
+        "GET",
+      ]);
+    });
+
+    it("reconnects when a log stream ends halfway through a record", async () => {
+      mockFetch
+        .mockResolvedValueOnce(
+          truncatedResponse([{ stream: "stdout", data: "one" }]),
+        )
+        .mockResolvedValueOnce(
+          response([{ stream: "stdout", data: "one two" }]),
+        );
+      const output = [];
+      for await (const log of client.getLogs({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+      }))
+        output.push(log.data);
+      expect(output.join("")).toBe("one two");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry malformed newline-terminated records", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response('{"stream":"stdout","data":}\n', {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+      await expect(
+        client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_123" }).next(),
+      ).rejects.toBeInstanceOf(SyntaxError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("accepts a complete final record without a newline", async () => {
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({ stream: "stdout", data: "one" }), {
+          headers: { "content-type": "application/x-ndjson" },
+        }),
+      );
+      const output = [];
+      for await (const log of client.getLogs({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+      }))
+        output.push(log.data);
+      expect(output).toEqual(["one"]);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("resumes a broken command stream without executing it again", async () => {
+      mockFetch
+        .mockResolvedValueOnce(response([{ command }], true))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      const result = await client.runCommand(params);
+      await expect(result.finished).resolves.toEqual(finished);
+      expect(mockFetch.mock.calls.map((call) => call[1].method)).toEqual([
+        "POST",
+        "GET",
+      ]);
+      expect(mockFetch.mock.calls[1][0]).toContain("wait=true");
+    });
+
+    it("replays command logs without duplicating stdout or stderr across different chunks", async () => {
+      const onLog = vi.fn();
+      mockFetch
+        .mockResolvedValueOnce(
+          response(
+            [
+              { command },
+              { stream: "stdout", data: "hé😀" },
+              { stream: "stderr", data: "warn" },
+            ],
+            true,
+          ),
+        )
+        .mockResolvedValueOnce(
+          response([
+            { stream: "stdout", data: "hé" },
+            { stream: "stderr", data: "warning" },
+            { stream: "stdout", data: "😀 world" },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      const result = await client.runCommand({ ...params, logs: true, onLog });
+      await expect(result.finished).resolves.toEqual(finished);
+      expect(onLog.mock.calls.map(([log]) => log)).toEqual([
+        { stream: "stdout", data: "hé😀" },
+        { stream: "stderr", data: "warn" },
+        { stream: "stderr", data: "ing" },
+        { stream: "stdout", data: " world" },
+      ]);
+      expect(
+        mockFetch.mock.calls.filter((call) => call[1].method === "POST"),
+      ).toHaveLength(1);
+    });
+
+    it("reconnects log streams and skips all output already delivered", async () => {
+      mockFetch
+        .mockResolvedValueOnce(
+          response([{ stream: "stdout", data: "one" }], true),
+        )
+        .mockResolvedValueOnce(
+          response([{ stream: "stdout", data: "one two" }], true),
+        )
+        .mockResolvedValueOnce(
+          response([{ stream: "stdout", data: "one two three" }]),
+        );
+      const output = [];
+      for await (const log of client.getLogs({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+      }))
+        output.push(log.data);
+      expect(output.join("")).toBe("one two three");
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("bounds retries when log connections keep breaking", async () => {
+      mockFetch.mockImplementation(() => Promise.resolve(response([], true)));
+      const logs = client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_123" });
+      await expect(logs.next()).rejects.toThrow(
+        "Stream connection was interrupted",
+      );
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("cancels recovery during the log retry delay", async () => {
+      mockFetch.mockResolvedValueOnce(
+        response([{ stream: "stdout", data: "one" }], true),
+      );
+      const controller = new AbortController();
+      const logs = client.getLogs({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+        signal: controller.signal,
+      });
+      await logs.next();
+      const next = logs.next();
+      setTimeout(() => controller.abort(), 30);
+      await expect(next).rejects.toMatchObject({ name: "AbortError" });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reconnect after a terminal command stream error", async () => {
+      mockFetch.mockResolvedValueOnce(
+        response([
+          { command },
+          {
+            stream: "error",
+            data: { code: "sandbox_stopped", message: "Sandbox stopped" },
+          },
+        ]),
+      );
+      const result = await client.runCommand(params);
+      await expect(result.finished).rejects.toMatchObject({
+        code: "sandbox_stopped",
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not retry log validation failures", async () => {
+      mockFetch.mockResolvedValueOnce(
+        response([{ stream: "stdout", data: 42 }]),
+      );
+      await expect(
+        client.getLogs({ sessionId: "sbx_123", cmdId: "cmd_123" }).next(),
+      ).rejects.toBeInstanceOf(z.ZodError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not rerun a command when the connection fails before its ID is received", async () => {
+      mockFetch.mockRejectedValue(new TypeError("fetch failed"));
+      await expect(client.runCommand(params)).rejects.toThrow("fetch failed");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves the original wait response after reading its body", async () => {
+      const text = JSON.stringify({ command: finished });
+      const original = new Response(text);
+      const readText = vi.spyOn(original, "text");
+      mockFetch.mockResolvedValueOnce(original);
+
+      const result = await client.getCommand({
+        sessionId: "sbx_123",
+        cmdId: "cmd_123",
+        wait: true,
+      });
+
+      expect(result.response).toBe(original);
+      expect(result.text).toBe(text);
+      expect(result.json.command).toEqual(finished);
+      expect(readText).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["invalid JSON", "{", "Can't parse JSON"],
+      ["invalid command data", '{"command":{}}', "Response JSON is not valid"],
+      ["empty body", "", "Response JSON is not valid"],
+    ])("does not retry a wait response with %s", async (_, text, message) => {
+      const original = new Response(text);
+      mockFetch.mockResolvedValueOnce(original);
+
+      await expect(
+        client.getCommand({
+          sessionId: "sbx_123",
+          cmdId: "cmd_123",
+          wait: true,
+        }),
+      ).rejects.toMatchObject({
+        response: original,
+        message: expect.stringContaining(message),
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries wait responses when the response body connection breaks", async () => {
+      mockFetch
+        .mockResolvedValueOnce(response([], true))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      await expect(
+        client.getCommand({
+          sessionId: "sbx_123",
+          cmdId: "cmd_123",
+          wait: true,
+        }),
+      ).resolves.toMatchObject({ json: { command: finished } });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(
+        mockFetch.mock.calls.every((call) => call[1].method === "GET"),
+      ).toBe(true);
+    });
+
+    it("retries 502s while waiting for an existing command", async () => {
+      mockFetch
+        .mockResolvedValueOnce(new Response("Bad Gateway", { status: 502 }))
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ command: finished })),
+        );
+      await expect(
+        client.getCommand({
+          sessionId: "sbx_123",
+          cmdId: "cmd_123",
+          wait: true,
+        }),
+      ).resolves.toMatchObject({ json: { command: finished } });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("stopSession", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSession = (status: string) => ({
+      id: "sbx_123",
+      memory: 2048,
+      vcpus: 1,
+      region: "iad1",
+      timeout: 300000,
+      status,
+      requestedAt: Date.now(),
+      createdAt: Date.now(),
+      cwd: "/",
+      updatedAt: Date.now(),
+    });
+
+    const makeSandbox = () => ({
+      name: "my-sandbox",
+      persistent: true,
+      region: "iad1",
+      vcpus: 1,
+      memory: 2048,
+      timeout: 300000,
+      totalActiveCpuDurationMs: 1200,
+      totalIngressBytes: 1200000,
+      totalEgressBytes: 3400000,
+      totalDurationMs: 45000,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      currentSessionId: "sbx_123",
+      currentSnapshotId: "snap_456",
+      status: "stopped" as const,
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("returns session from stop response", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ session: makeSession("stopped") }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.stopSession({ sessionId: "sbx_123" });
+
+      expect(result.json.session.status).toBe("stopped");
+      expect(result.json.sandbox).toBeUndefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("parses sandbox metadata from stop response", async () => {
+      const sandbox = makeSandbox();
+      mockFetch.mockResolvedValue(
+        new Response(
+          JSON.stringify({ session: makeSession("stopped"), sandbox }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+
+      const result = await client.stopSession({ sessionId: "sbx_123" });
+
+      expect(result.json.session.status).toBe("stopped");
+      expect(result.json.sandbox).toBeDefined();
+      expect(result.json.sandbox?.name).toBe("my-sandbox");
+      expect(result.json.sandbox?.totalActiveCpuDurationMs).toBe(1200);
+      expect(result.json.sandbox?.totalIngressBytes).toBe(1200000);
+      expect(result.json.sandbox?.totalEgressBytes).toBe(3400000);
+      expect(result.json.sandbox?.totalDurationMs).toBe(45000);
+      expect(result.json.sandbox?.currentSnapshotId).toBe("snap_456");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("getSandbox", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSandboxMetadata = () => ({
+      name: "my-sandbox",
+      persistent: true,
+      region: "iad1",
+      vcpus: 1,
+      memory: 2048,
+      timeout: 300000,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: "running" as const,
+      currentSessionId: "sbx_123",
+    });
+
+    const makeSession = () => ({
+      id: "sbx_123",
+      memory: 2048,
+      vcpus: 1,
+      region: "iad1",
+      timeout: 300000,
+      status: "running",
+      requestedAt: Date.now(),
+      createdAt: Date.now(),
+      cwd: "/",
+      updatedAt: Date.now(),
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("fetches a sandbox by name and projectId", async () => {
+      const body = {
+        sandbox: makeSandboxMetadata(),
+        session: makeSession(),
+        routes: [{ url: "https://example.com", subdomain: "sbx", port: 3000 }],
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.getSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+      });
+
+      expect(result.json.sandbox.name).toBe("my-sandbox");
+      expect(result.json.session.id).toBe("sbx_123");
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes/my-sandbox");
+      expect(url).toContain("projectId=proj_123");
+    });
+
+    it("passes resume query param when provided", async () => {
+      const body = {
+        sandbox: makeSandboxMetadata(),
+        session: makeSession(),
+        routes: [],
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.getSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        resume: true,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("resume=true");
+    });
+
+    it("exposes the source image when present", async () => {
+      const body = {
+        sandbox: {
+          ...makeSandboxMetadata(),
+          image: "my-repo@sha256:2c4e8f9a1b3d5e7f",
+        },
+        session: makeSession(),
+        routes: [],
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.getSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+      });
+
+      expect(result.json.sandbox.image).toBe("my-repo@sha256:2c4e8f9a1b3d5e7f");
+    });
+  });
+
+  describe("listDrives", () => {
+    it("passes the supported query parameters", async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            drives: [],
+            pagination: { count: 0, next: null },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+      const client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+
+      await client.listDrives({
+        projectId: "proj_123",
+        limit: 5,
+        cursor: "opaque-cursor",
+        sortBy: "name",
+        sortOrder: "asc",
+        namePrefix: "test-",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("projectId=proj_123");
+      expect(url).toContain("limit=5");
+      expect(url).toContain("cursor=opaque-cursor");
+      expect(url).toContain("sortBy=name");
+      expect(url).toContain("sortOrder=asc");
+      expect(url).toContain("namePrefix=test-");
+    });
+  });
+
+  describe("listSandboxes", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSandboxMetadata = (name: string) => ({
+      name,
+      persistent: false,
+      region: "iad1",
+      vcpus: 1,
+      memory: 2048,
+      timeout: 300000,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: "running" as const,
+      currentSessionId: "sbx_123",
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("lists sandboxes with pagination", async () => {
+      const body = {
+        sandboxes: [makeSandboxMetadata("sb-1"), makeSandboxMetadata("sb-2")],
+        pagination: { count: 2, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.listSandboxes({
+        projectId: "proj_123",
+      });
+
+      expect(result.json.sandboxes).toHaveLength(2);
+      expect(result.json.sandboxes[0].name).toBe("sb-1");
+      expect(result.json.pagination.count).toBe(2);
+    });
+
+    it("passes all query params", async () => {
+      const body = {
+        sandboxes: [],
+        pagination: { count: 0, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.listSandboxes({
+        projectId: "proj_123",
+        limit: 5,
+        sortBy: "name",
+        namePrefix: "test-",
+        cursor: "abc",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("project=proj_123");
+      expect(url).toContain("limit=5");
+      expect(url).toContain("sortBy=name");
+      expect(url).toContain("namePrefix=test-");
+      expect(url).toContain("cursor=abc");
+    });
+
+    it("passes a single tag filter as a query param", async () => {
+      const body = {
+        sandboxes: [],
+        pagination: { count: 0, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.listSandboxes({
+        projectId: "proj_123",
+        tags: { env: "staging" },
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain(`tags=${encodeURIComponent("env:staging")}`);
+    });
+
+    it("rejects multiple tag filters at the type level", () => {
+      const check = () =>
+        client.listSandboxes({
+          projectId: "proj_123",
+          // @ts-expect-error — only a single tag filter is supported
+          tags: { env: "staging", team: "infra" },
+        });
+      expect(check).toBeInstanceOf(Function);
+    });
+
+    it("rejects multiple tag filters at runtime", async () => {
+      await expect(
+        client.listSandboxes({
+          projectId: "proj_123",
+          // @ts-expect-error — only a single tag filter is supported
+          tags: { env: "staging", team: "infra" },
+        }),
+      ).rejects.toThrow("Filtering by multiple tags is not supported");
+    });
+
+    it("passes sortOrder and sortBy statusUpdatedAt", async () => {
+      const body = {
+        sandboxes: [makeSandboxMetadata("sb-1")],
+        pagination: { count: 1, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.listSandboxes({
+        projectId: "proj_123",
+        sortBy: "statusUpdatedAt",
+        sortOrder: "desc",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("sortBy=statusUpdatedAt");
+      expect(url).toContain("sortOrder=desc");
+    });
+  });
+
+  describe("listSessions", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSession = () => ({
+      id: "sbx_123",
+      memory: 2048,
+      vcpus: 1,
+      region: "iad1",
+      timeout: 300000,
+      status: "running",
+      requestedAt: Date.now(),
+      createdAt: Date.now(),
+      cwd: "/",
+      updatedAt: Date.now(),
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("lists sessions with cursor pagination", async () => {
+      const body = {
+        sessions: [makeSession()],
+        pagination: { count: 1, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.listSessions({
+        projectId: "proj_123",
+      });
+
+      expect(result.json.sessions).toHaveLength(1);
+      expect(result.json.pagination.count).toBe(1);
+      expect(result.json.pagination.next).toBeNull();
+    });
+
+    it("passes cursor and sortOrder params", async () => {
+      const body = {
+        sessions: [],
+        pagination: { count: 0, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.listSessions({
+        projectId: "proj_123",
+        cursor: "cursor_abc",
+        sortOrder: "asc",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("cursor=cursor_abc");
+      expect(url).toContain("sortOrder=asc");
+    });
+  });
+
+  describe("listSnapshots", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSnapshot = () => ({
+      id: "snap_123",
+      sourceSessionId: "sbx_123",
+      region: "iad1",
+      status: "created",
+      sizeBytes: 1024,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("lists snapshots with cursor pagination", async () => {
+      const body = {
+        snapshots: [makeSnapshot()],
+        pagination: { count: 1, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.listSnapshots({
+        projectId: "proj_123",
+      });
+
+      expect(result.json.snapshots).toHaveLength(1);
+      expect(result.json.pagination.count).toBe(1);
+      expect(result.json.pagination.next).toBeNull();
+    });
+
+    it("passes cursor and sortOrder params", async () => {
+      const body = {
+        snapshots: [],
+        pagination: { count: 0, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.listSnapshots({
+        projectId: "proj_123",
+        cursor: "cursor_xyz",
+        sortOrder: "desc",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("cursor=cursor_xyz");
+      expect(url).toContain("sortOrder=desc");
+    });
+  });
+
+  describe("getSnapshotTree", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSnapshot = (
+      overrides: Partial<Record<string, unknown>> = {},
+    ) => ({
+      id: "snap_123",
+      sourceSessionId: "sbx_123",
+      region: "iad1",
+      status: "created",
+      sizeBytes: 1024,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("fetches tree with required snapshotId and projectId", async () => {
+      const body = {
+        snapshots: [
+          {
+            snapshot: makeSnapshot({
+              id: "snap_parent",
+              parentId: "snap_root",
+            }),
+            siblings: [],
+            count: "1",
+          },
+        ],
+        pagination: { count: 1, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.getSnapshotTree({
+        projectId: "proj_123",
+        snapshotId: "snap_123",
+      });
+
+      expect(result.json.snapshots).toHaveLength(1);
+      expect(result.json.snapshots[0].snapshot.id).toBe("snap_parent");
+      expect(result.json.snapshots[0].count).toBe("1");
+      expect(result.json.pagination.count).toBe(1);
+      expect(result.json.pagination.next).toBeNull();
+
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes/snapshots/tree");
+      expect(url).toContain("project=proj_123");
+      expect(url).toContain("snapshotId=snap_123");
+      expect(url).toContain("teamId=team_123");
+      expect(opts.method).toBe("GET");
+    });
+
+    it("passes limit and sortOrder query params", async () => {
+      const body = {
+        snapshots: [],
+        pagination: { count: 0, next: null },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.getSnapshotTree({
+        projectId: "proj_123",
+        snapshotId: "snap_123",
+        limit: 5,
+        sortOrder: "asc",
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("limit=5");
+      expect(url).toContain("sortOrder=asc");
+    });
+
+    it("parses pagination.next for continuation", async () => {
+      const body = {
+        snapshots: [
+          {
+            snapshot: makeSnapshot({ id: "snap_a", parentId: "snap_b" }),
+            siblings: [],
+            count: "1",
+          },
+        ],
+        pagination: { count: 1, next: "snap_a" },
+      };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.getSnapshotTree({
+        projectId: "proj_123",
+        snapshotId: "snap_123",
+      });
+
+      expect(result.json.pagination.next).toBe("snap_a");
+    });
+  });
+
+  describe("updateSandbox", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSandboxMetadata = () => ({
+      name: "my-sandbox",
+      persistent: true,
+      region: "iad1",
+      vcpus: 2,
+      memory: 4096,
+      timeout: 600000,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: "running" as const,
+      currentSessionId: "sbx_123",
+      snapshotExpiration: 604800000,
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("sends PATCH with update fields", async () => {
+      const body = { sandbox: makeSandboxMetadata() };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.updateSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        persistent: true,
+        timeout: 600000,
+        ports: [3000, 4000],
+        snapshotExpiration: 604800000,
+        keepLastSnapshots: { count: 5, expiration: 0, deleteEvicted: false },
+        currentSnapshotId: "snap_abc123",
+      });
+
+      expect(result.json.sandbox.name).toBe("my-sandbox");
+
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes/my-sandbox");
+      expect(url).toContain("projectId=proj_123");
+      expect(opts.method).toBe("PATCH");
+
+      const parsedBody = JSON.parse(opts.body);
+      expect(parsedBody.persistent).toBe(true);
+      expect(parsedBody.timeout).toBe(600000);
+      expect(parsedBody.ports).toEqual([3000, 4000]);
+      expect(parsedBody.snapshotExpiration).toBe(604800000);
+      expect(parsedBody.keepLastSnapshots).toEqual({
+        count: 5,
+        expiration: 0,
+        deleteEvicted: false,
+      });
+      expect(parsedBody.currentSnapshotId).toBe("snap_abc123");
+    });
+
+    it("sends null to clear keepLastSnapshots", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ sandbox: makeSandboxMetadata() }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.updateSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        keepLastSnapshots: null,
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      // Presence of the key with null — not undefined/missing — is the signal.
+      expect(
+        Object.prototype.hasOwnProperty.call(body, "keepLastSnapshots"),
+      ).toBe(true);
+      expect(body.keepLastSnapshots).toBeNull();
+    });
+
+    it("forwards region and failoverRegions in the request body", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ sandbox: makeSandboxMetadata() }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.updateSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        region: "sfo1",
+        failoverRegions: ["iad1"],
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body.region).toBe("sfo1");
+      expect(body.failoverRegions).toEqual(["iad1"]);
+    });
+
+    it.each([
+      ["sets", "network_123"],
+      ["clears", null],
+    ])("%s the Secure Compute network", async (_action, networkId) => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ sandbox: makeSandboxMetadata() }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.updateSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        networkId,
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      expect(JSON.parse(opts.body)).toHaveProperty("networkId", networkId);
+    });
+
+    it("sends an empty failoverRegions array to clear them", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ sandbox: makeSandboxMetadata() }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.updateSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        failoverRegions: [],
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body.failoverRegions).toEqual([]);
+      expect(body).not.toHaveProperty("region");
+    });
+  });
+
+  describe("deleteSandbox", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const makeSandboxMetadata = () => ({
+      name: "my-sandbox",
+      persistent: false,
+      region: "iad1",
+      vcpus: 1,
+      memory: 2048,
+      timeout: 300000,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      status: "running" as const,
+      currentSessionId: "sbx_123",
+    });
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("sends DELETE with projectId", async () => {
+      const body = { sandbox: makeSandboxMetadata() };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const result = await client.deleteSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+      });
+
+      expect(result.json.sandbox.name).toBe("my-sandbox");
+
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes/my-sandbox");
+      expect(url).toContain("projectId=proj_123");
+      expect(url).not.toContain("deleteOrphanSnapshots");
+      expect(opts.method).toBe("DELETE");
+    });
+
+    it("sends deleteOrphanSnapshots when requested", async () => {
+      const body = { sandbox: makeSandboxMetadata() };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.deleteSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        deleteOrphanSnapshots: true,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("deleteOrphanSnapshots=true");
+    });
+
+    it("omits deleteOrphanSnapshots when false", async () => {
+      const body = { sandbox: makeSandboxMetadata() };
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.deleteSandbox({
+        name: "my-sandbox",
+        projectId: "proj_123",
+        deleteOrphanSnapshots: false,
+      });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).not.toContain("deleteOrphanSnapshots");
+    });
+  });
+
+  describe("createSnapshot", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("sends zero expiration for no expiration", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            session: {
+              id: "sbx_123",
+              memory: 2048,
+              vcpus: 1,
+              region: "iad1",
+              timeout: 300000,
+              status: "running",
+              requestedAt: Date.now(),
+              createdAt: Date.now(),
+              cwd: "/",
+              updatedAt: Date.now(),
+            },
+            snapshot: {
+              id: "snap_123",
+              sourceSessionId: "sbx_123",
+              region: "iad1",
+              status: "created",
+              sizeBytes: 1024,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+
+      await client.createSnapshot({
+        sessionId: "sbx_123",
+        expiration: 0,
+      });
+
+      expect(mockFetch.mock.calls[0]?.[1]?.body).toBe(
+        JSON.stringify({ expiration: 0 }),
+      );
+    });
+  });
+
+  describe("createSandbox", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const sandboxResponse = () =>
+      new Response(
+        JSON.stringify({
+          sandbox: {
+            name: "my-sandbox",
+            persistent: true,
+            region: "iad1",
+            vcpus: 1,
+            memory: 2048,
+            timeout: 300000,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            status: "running",
+            currentSessionId: "sbx_123",
+            keepLastSnapshots: {
+              count: 3,
+              expiration: 604800000,
+              deleteEvicted: true,
+            },
+          },
+          session: {
+            id: "sbx_123",
+            memory: 2048,
+            vcpus: 1,
+            region: "iad1",
+            timeout: 300000,
+            status: "running",
+            requestedAt: Date.now(),
+            createdAt: Date.now(),
+            cwd: "/",
+            updatedAt: Date.now(),
+          },
+          routes: [],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("forwards keepLastSnapshots in the request body", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({
+        projectId: "proj_123",
+        keepLastSnapshots: {
+          count: 3,
+          expiration: 604800000,
+          deleteEvicted: true,
+        },
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body.keepLastSnapshots).toEqual({
+        count: 3,
+        expiration: 604800000,
+        deleteEvicted: true,
+      });
+    });
+
+    it("omits keepLastSnapshots when not provided", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({ projectId: "proj_123" });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body).not.toHaveProperty("keepLastSnapshots");
+    });
+
+    it("forwards networkId in the request body", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({
+        projectId: "proj_123",
+        networkId: "network_123",
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      expect(JSON.parse(opts.body).networkId).toBe("network_123");
+    });
+
+    it("omits networkId when not provided", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({ projectId: "proj_123" });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      expect(JSON.parse(opts.body)).not.toHaveProperty("networkId");
+    });
+
+    it("forwards region and failoverRegions in the request body", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({
+        projectId: "proj_123",
+        region: "iad1",
+        failoverRegions: ["sfo1"],
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body.region).toBe("iad1");
+      expect(body.failoverRegions).toEqual(["sfo1"]);
+    });
+
+    it("omits region and failoverRegions when not provided", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({ projectId: "proj_123" });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body).not.toHaveProperty("region");
+      expect(body).not.toHaveProperty("failoverRegions");
+    });
+
+    it("uses v2 when runtime is provided", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({
+        projectId: "proj_123",
+        runtime: "node24",
+      });
+
+      const [url, opts] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes");
+      expect(JSON.parse(opts.body).runtime).toBe("node24");
+    });
+
+    it("uses v3 when runtime is omitted", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.createSandbox({ projectId: "proj_123" });
+
+      const [url] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v3/sandboxes");
+    });
+  });
+
+  describe("forkSandbox", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    const sandboxResponse = () =>
+      new Response(
+        JSON.stringify({
+          sandbox: {
+            name: "my-fork",
+            persistent: true,
+            region: "iad1",
+            vcpus: 1,
+            memory: 2048,
+            timeout: 300000,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            status: "running",
+            currentSessionId: "sbx_123",
+          },
+          session: {
+            id: "sbx_123",
+            memory: 2048,
+            vcpus: 1,
+            region: "iad1",
+            timeout: 300000,
+            status: "running",
+            requestedAt: Date.now(),
+            createdAt: Date.now(),
+            cwd: "/",
+            updatedAt: Date.now(),
+          },
+          routes: [],
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("forwards region and failoverRegions in the request body", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.forkSandbox({
+        projectId: "proj_123",
+        sourceSandbox: "my-sandbox",
+        region: "sfo1",
+        failoverRegions: ["iad1"],
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      const body = JSON.parse(opts.body);
+      expect(body.region).toBe("sfo1");
+      expect(body.failoverRegions).toEqual(["iad1"]);
+    });
+
+    it("forwards networkId in the request body", async () => {
+      mockFetch.mockResolvedValue(sandboxResponse());
+
+      await client.forkSandbox({
+        projectId: "proj_123",
+        sourceSandbox: "my-sandbox",
+        networkId: "network_123",
+      });
+
+      const [, opts] = mockFetch.mock.calls[0];
+      expect(JSON.parse(opts.body).networkId).toBe("network_123");
+    });
+  });
+
+  describe("readFile", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("throws APIError when the API returns a non-2xx with an error payload", async () => {
+      const errorBody = JSON.stringify({
+        error: {
+          code: "sandbox_stopped",
+          message: "Sandbox has stopped execution and is no longer available",
+        },
+      });
+
+      mockFetch.mockResolvedValue(
+        new Response(errorBody, {
+          status: 410,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await expect(
+        client.readFile({ sessionId: "sbx_123", path: "/probe.txt" }),
+      ).rejects.toThrow(APIError);
+    });
+
+    it("throws APIError when the response is 2xx but the content-type is not octet-stream", async () => {
+      const errorBody = JSON.stringify({
+        error: {
+          code: "sandbox_stopped",
+          message: "Sandbox has stopped execution and is no longer available",
+        },
+      });
+
+      mockFetch.mockResolvedValue(
+        new Response(errorBody, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await expect(
+        client.readFile({ sessionId: "sbx_123", path: "/probe.txt" }),
+      ).rejects.toThrow(APIError);
+    });
+
+    it("returns the readable stream when the content-type is octet-stream", async () => {
+      mockFetch.mockResolvedValue(
+        new Response("hello world", {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" },
+        }),
+      );
+
+      const stream = await client.readFile({
+        sessionId: "sbx_123",
+        path: "/probe.txt",
+      });
+      expect(stream).not.toBeNull();
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream!) {
+        chunks.push(chunk as Buffer);
+      }
+      expect(Buffer.concat(chunks).toString()).toBe("hello world");
+    });
+
+    it("returns null when the API returns 404", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(null, {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      const stream = await client.readFile({
+        sessionId: "sbx_123",
+        path: "/probe.txt",
+      });
+      expect(stream).toBeNull();
+    });
+  });
+
+  describe("writeCommandStdin", () => {
+    let client: APIClient;
+    let mockFetch: ReturnType<typeof vi.fn>;
+    const command = {
+      id: "cmd_123",
+      name: "cat",
+      args: [],
+      cwd: "/",
+      sessionId: "sbx_123",
+      exitCode: null,
+      startedAt: 1,
+    };
+
+    beforeEach(() => {
+      mockFetch = vi.fn();
+      client = new APIClient({
+        teamId: "team_123",
+        token: "1234",
+        fetch: mockFetch,
+      });
+    });
+
+    it("sends data as base64", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ command }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.writeCommandStdin({
+        sessionId: "sbx_123",
+        commandId: "cmd_123",
+        data: new TextEncoder().encode("hello\n"),
+      });
+
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toContain("/v2/sandboxes/sessions/sbx_123/cmd/cmd_123/stdin");
+      expect(init.method).toBe("POST");
+      expect(JSON.parse(init.body)).toEqual({
+        data: Buffer.from("hello\n").toString("base64"),
+      });
+    });
+
+    it("sends close without data", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ command }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.writeCommandStdin({
+        sessionId: "sbx_123",
+        commandId: "cmd_123",
+        close: true,
+      });
+
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toEqual({
+        close: true,
+      });
+    });
+
+    it("does not retry server errors", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ error: { code: "internal" } }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await expect(
+        client.writeCommandStdin({
+          sessionId: "sbx_123",
+          commandId: "cmd_123",
+          data: new Uint8Array([1]),
+        }),
+      ).rejects.toBeInstanceOf(APIError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    const rateLimited = (retryAfter: string) =>
+      new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "Retry-After": retryAfter,
+        },
+      });
+
+    it("retries rate limited writes", async () => {
+      mockFetch.mockResolvedValueOnce(rateLimited("0")).mockResolvedValueOnce(
+        new Response(JSON.stringify({ command }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+      await client.writeCommandStdin({
+        sessionId: "sbx_123",
+        commandId: "cmd_123",
+        data: new Uint8Array([1]),
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("gives up after repeated rate limiting", async () => {
+      vi.useFakeTimers();
+      try {
+        mockFetch.mockImplementation(async () => rateLimited("0"));
+
+        const result = expect(
+          client.writeCommandStdin({
+            sessionId: "sbx_123",
+            commandId: "cmd_123",
+            data: new Uint8Array([1]),
+          }),
+        ).rejects.toBeInstanceOf(APIError);
+        await vi.runAllTimersAsync();
+        await result;
+        expect(mockFetch).toHaveBeenCalledTimes(6);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not wait out a long Retry-After", async () => {
+      mockFetch.mockResolvedValueOnce(rateLimited("60"));
+
+      await expect(
+        client.writeCommandStdin({
+          sessionId: "sbx_123",
+          commandId: "cmd_123",
+          data: new Uint8Array([1]),
+        }),
+      ).rejects.toBeInstanceOf(APIError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not retry network errors", async () => {
+      mockFetch.mockRejectedValue(new TypeError("fetch failed"));
+
+      await expect(
+        client.writeCommandStdin({
+          sessionId: "sbx_123",
+          commandId: "cmd_123",
+          data: new Uint8Array([1]),
+        }),
+      ).rejects.toThrow("fetch failed");
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    describe("with an offset", () => {
+      const written = (bytesWritten: number) =>
+        new Response(JSON.stringify({ command, bytesWritten }), {
+          headers: { "content-type": "application/json" },
+        });
+      const failure = (status: number) =>
+        new Response(JSON.stringify({ error: { code: "failed" } }), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      const bodies = () =>
+        mockFetch.mock.calls.map(([, init]) => JSON.parse(init.body));
+      const write = (params: { data?: Uint8Array; close?: boolean } = {}) =>
+        client.writeCommandStdin({
+          sessionId: "sbx_123",
+          commandId: "cmd_123",
+          offset: 4,
+          data: new Uint8Array([1, 2]),
+          ...params,
+        });
+
+      beforeEach(() => vi.useFakeTimers());
+      afterEach(() => vi.useRealTimers());
+
+      async function settle<T>(promise: Promise<T>) {
+        const result = promise.then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        );
+        await vi.runAllTimersAsync();
+        return result;
+      }
+
+      it("sends the offset and returns bytesWritten", async () => {
+        mockFetch.mockResolvedValue(written(6));
+
+        const result = await settle(write());
+
+        expect(result).toEqual({ value: { bytesWritten: 6 } });
+        expect(bodies()).toEqual([
+          { data: Buffer.from([1, 2]).toString("base64"), offset: 4 },
+        ]);
+      });
+
+      it.each([502, 503])("resends the same request after a %i", async (status) => {
+        mockFetch
+          .mockResolvedValueOnce(failure(status))
+          .mockResolvedValueOnce(written(6));
+
+        const result = await settle(write());
+
+        expect(result).toEqual({ value: { bytesWritten: 6 } });
+        expect(mockFetch).toHaveBeenCalledTimes(2);
+        expect(bodies()[1]).toEqual(bodies()[0]);
+      });
+
+      it("resends the same request after a network error", async () => {
+        mockFetch
+          .mockRejectedValueOnce(new TypeError("fetch failed"))
+          .mockResolvedValueOnce(written(6));
+
+        const result = await settle(write());
+
+        expect(result).toEqual({ value: { bytesWritten: 6 } });
+        expect(bodies()[1]).toEqual(bodies()[0]);
+      });
+
+      it("does not resend after an abort", async () => {
+        const controller = new AbortController();
+        mockFetch.mockImplementationOnce(async () => {
+          controller.abort();
+          throw new DOMException("aborted", "AbortError");
+        });
+
+        const result = await settle(
+          client.writeCommandStdin({
+            sessionId: "sbx_123",
+            commandId: "cmd_123",
+            offset: 4,
+            data: new Uint8Array([1]),
+            abortSignal: controller.signal,
+          }),
+        );
+
+        expect(result).toHaveProperty("error");
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      });
+
+      it("gives up after repeated failures", async () => {
+        mockFetch.mockImplementation(async () => failure(503));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+        expect(mockFetch).toHaveBeenCalledTimes(6);
+      });
+
+      it("does not resend a plain 500", async () => {
+        mockFetch.mockResolvedValue(failure(500));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not resend an offset mismatch", async () => {
+        mockFetch.mockResolvedValue(failure(409));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      });
+
+      it("resends after a timeout while the process keeps reading", async () => {
+        mockFetch
+          .mockResolvedValueOnce(failure(504))
+          .mockResolvedValueOnce(written(5))
+          .mockResolvedValueOnce(failure(504))
+          .mockResolvedValueOnce(written(7))
+          .mockResolvedValueOnce(failure(504))
+          .mockResolvedValueOnce(written(9))
+          .mockResolvedValueOnce(written(10));
+
+        const result = await settle(write({ data: new Uint8Array(6) }));
+
+        expect(result).toEqual({ value: { bytesWritten: 10 } });
+        expect(bodies().map((b) => b.data !== undefined)).toEqual([
+          true,
+          false,
+          true,
+          false,
+          true,
+          false,
+          true,
+        ]);
+      });
+
+      it("gives up on timeouts when the process stops reading", async () => {
+        mockFetch
+          .mockResolvedValueOnce(failure(504))
+          .mockResolvedValueOnce(written(4))
+          .mockResolvedValueOnce(failure(504))
+          .mockResolvedValueOnce(written(4));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+        expect(
+          (result as { error: APIError<unknown> }).error.response.status,
+        ).toBe(504);
+        expect(mockFetch).toHaveBeenCalledTimes(4);
+      });
+
+      it("uses the bytes written a timeout reports instead of asking for them", async () => {
+        const timeout = (bytesWritten: number) =>
+          new Response(
+            JSON.stringify({
+              error: { code: "command_stdin_timeout", bytesWritten },
+            }),
+            { status: 504, headers: { "content-type": "application/json" } },
+          );
+        mockFetch
+          .mockResolvedValueOnce(timeout(5))
+          .mockResolvedValueOnce(timeout(5))
+          .mockResolvedValueOnce(timeout(5));
+
+        const result = await settle(write());
+
+        expect(result).toMatchObject({
+          error: { response: { status: 504 } },
+        });
+        expect(bodies().every((b) => b.data !== undefined)).toBe(true);
+        expect(mockFetch).toHaveBeenCalledTimes(3);
+      });
+
+      it("treats a resent close that finds the command gone as closed", async () => {
+        mockFetch
+          .mockRejectedValueOnce(new TypeError("fetch failed"))
+          .mockResolvedValueOnce(failure(404));
+
+        const result = await settle(write({ data: undefined, close: true }));
+
+        expect(result).toEqual({ value: {} });
+      });
+
+      it("fails a first close that finds the command gone", async () => {
+        mockFetch.mockResolvedValueOnce(failure(404));
+
+        const result = await settle(write({ data: undefined, close: true }));
+
+        expect(result).toHaveProperty("error");
+      });
+
+      it("fails a resent write that finds the command gone", async () => {
+        mockFetch
+          .mockRejectedValueOnce(new TypeError("fetch failed"))
+          .mockResolvedValueOnce(failure(404));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+      });
+
+      it("shares one retry budget between rate limits and failures", async () => {
+        mockFetch
+          .mockResolvedValueOnce(rateLimited("0"))
+          .mockResolvedValueOnce(failure(503))
+          .mockResolvedValueOnce(rateLimited("0"))
+          .mockResolvedValueOnce(failure(503))
+          .mockResolvedValueOnce(rateLimited("0"))
+          .mockResolvedValueOnce(failure(503));
+
+        const result = await settle(write());
+
+        expect(result).toHaveProperty("error");
+        expect(mockFetch).toHaveBeenCalledTimes(6);
+      });
+
+      it("treats an empty request as a retryable probe", async () => {
+        mockFetch
+          .mockResolvedValueOnce(failure(503))
+          .mockResolvedValueOnce(written(3));
+
+        const result = await settle(
+          client.writeCommandStdin({
+            sessionId: "sbx_123",
+            commandId: "cmd_123",
+          }),
+        );
+
+        expect(result).toEqual({ value: { bytesWritten: 3 } });
+        expect(bodies()).toEqual([{}, {}]);
+      });
+    });
+  });
+});

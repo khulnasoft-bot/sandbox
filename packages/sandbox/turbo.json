@@ -1,0 +1,15 @@
+{
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "env": ["KHULNASOFT_ENV"],
+      "inputs": ["package.json", "src/**"],
+      "outputs": ["dist"],
+      "cache": true
+    },
+    "version:bump": {
+      "inputs": ["src"],
+      "outputs": ["docs"]
+    }
+  }
+}

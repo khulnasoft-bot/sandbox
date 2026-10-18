@@ -1,0 +1,1957 @@
+import { WORKFLOW_DESERIALIZE, WORKFLOW_SERIALIZE } from "@workflow/serde";
+import type {
+  SessionMetaData,
+  SandboxRouteData,
+  SandboxMetaData,
+  SnapshotMetadata,
+} from "./api-client/index.js";
+import { APIClient } from "./api-client/index.js";
+import { APIError } from "./api-client/api-error.js";
+import { type Credentials, getCredentials } from "./utils/get-credentials.js";
+import { getPrivateParams, type WithPrivate } from "./utils/types.js";
+import type {
+  SingleTagFilter,
+  WithFetchOptions,
+} from "./api-client/api-client.js";
+import { DEFAULT_SANDBOX_REGION } from "./constants.js";
+import type { ManagedImage, RUNTIMES, SandboxRegion } from "./constants.js";
+import { Session, type RunCommandParams } from "./session.js";
+import type { Command, CommandFinished } from "./command.js";
+import type { Drive } from "./drive.js";
+import type { Snapshot } from "./snapshot.js";
+import type { SandboxSnapshot } from "./utils/sandbox-snapshot.js";
+import type {
+  NetworkPolicy,
+  NetworkPolicyKeyValueMatcher,
+  NetworkPolicyMatch,
+  NetworkPolicyMatcher,
+} from "./network-policy.js";
+import { fromAPINetworkPolicy } from "./utils/network-policy.js";
+import { attachPaginator } from "./utils/paginator.js";
+import { FileSystem } from "./filesystem.js";
+import { SandboxUser, SandboxUserAlreadyExistsError } from "./sandbox-user.js";
+import type { ExecutionContext } from "./execution-context.js";
+import { validateName } from "./utils/validate-name.js";
+
+export type {
+  NetworkPolicy,
+  NetworkPolicyKeyValueMatcher,
+  NetworkPolicyMatch,
+  NetworkPolicyMatcher,
+};
+
+/** @inline */
+export interface BaseCreateSandboxParams {
+  /**
+   * The name of the sandbox. If omitted, a random name will be generated.
+   */
+  name?: string;
+  /**
+   * The source of the sandbox.
+   *
+   * Omit this parameter start a sandbox without a source.
+   *
+   * For git sources:
+   * - `depth`: Creates shallow clones with limited commit history (minimum: 1)
+   * - `revision`: Clones and checks out a specific commit, branch, or tag
+   */
+  source?:
+    | {
+        type: "git";
+        url: string;
+        depth?: number;
+        revision?: string;
+      }
+    | {
+        type: "git";
+        url: string;
+        username: string;
+        password: string;
+        depth?: number;
+        revision?: string;
+      }
+    | { type: "tarball"; url: string };
+  /**
+   * Array of port numbers to expose from the sandbox. Sandboxes can
+   * expose up to 15 ports.
+   */
+  ports?: number[];
+  /**
+   * Timeout in milliseconds before the sandbox auto-terminates.
+   */
+  timeout?: number;
+  /**
+   * Resources to allocate to the sandbox.
+   *
+   * Your sandbox will get the amount of vCPUs you specify here and
+   * 2048 MB of memory per vCPU.
+   */
+  resources?: { vcpus: number };
+  /**
+   * Network policy to define network restrictions for the sandbox.
+   * Defaults to full internet access if not specified.
+   */
+  networkPolicy?: NetworkPolicy;
+  /**
+   * Connect network ID for the target Secure Compute private network.
+   */
+  networkId?: string;
+  /**
+   * Default environment variables for the sandbox.
+   * These are inherited by all commands unless overridden with
+   * the `env` option in `runCommand`.
+   *
+   * @example
+   * const sandbox = await Sandbox.create({
+   *   env: { NODE_ENV: "production", API_KEY: "secret" },
+   * });
+   * // All commands will have NODE_ENV and API_KEY set
+   * await sandbox.runCommand("node", ["app.js"]);
+   */
+  env?: Record<string, string>;
+  /**
+   * Key-value tags to associate with the sandbox. Maximum 5 tags.
+   * @example { env: "staging", team: "infra" }
+   */
+  tags?: Record<string, string>;
+  /**
+   * The region to create the sandbox in. Defaults to `iad1`. Any Khulnasoft
+   * region is supported, e.g. `sfo1`, `fra1`, `hnd1`, `syd1`.
+   * See the Khulnasoft documentation for the full list.
+   */
+  region?: SandboxRegion;
+  /**
+   * Additional regions the sandbox can fail over to, e.g. `["sfo1", "fra1"]`.
+   * Must not include `region`.
+   */
+  failoverRegions?: SandboxRegion[];
+
+  /**
+   * List of drives to attach to the sandbox, keyed by the desired mount path.
+   * The drive must be created beforehand with `Drive.getOrCreate`.
+   *
+   * The mount paths must be absolute and cannot overlap with each other.
+   *
+   * @example
+   * const drive = await Drive.getOrCreate({ name: "my-drive" });
+   * const sandbox = await Sandbox.create({
+   *   mounts: {
+   *     "/data": drive,
+   *     "/snapshot": drive.snapshot(),
+   *   },
+   * });
+   */
+  mounts?: SandboxMounts;
+
+  /**
+   * An AbortSignal to cancel sandbox creation.
+   */
+  signal?: AbortSignal;
+  /**
+   * Enable or disable automatic restore of the filesystem between sessions.
+   */
+  persistent?: boolean;
+  /**
+   * Default snapshot expiration in milliseconds.
+   * When set, snapshots created for this sandbox will expire after this duration.
+   * Use `0` for no expiration.
+   */
+  snapshotExpiration?: number;
+  /**
+   * Retention policy that keeps only the N most recent snapshots of this
+   * sandbox. Older snapshots are evicted when a new one is created.
+   */
+  keepLastSnapshots?: {
+    /**
+     * Number of snapshots to keep (1-10).
+     */
+    count: number;
+    /**
+     * Expiration in milliseconds applied to kept snapshots.
+     * Use `0` for no expiration. Falls back to `snapshotExpiration` when omitted.
+     */
+    expiration?: number;
+    /**
+     * When `true` (the default), evicted snapshots are deleted immediately;
+     * when `false`, they keep the default expiration.
+     */
+    deleteEvicted?: boolean;
+  };
+  /**
+   * Called when the sandbox session is resumed (e.g., after a snapshot restore).
+   * Use this to re-warm caches, restore transient state, or run other setup logic.
+   */
+  onResume?: (sandbox: Sandbox) => Promise<void>;
+}
+
+export type SandboxMountMode = "read-write" | "snapshot";
+export type SandboxMounts = Record<
+  string,
+  Drive | { drive: string; mode: SandboxMountMode }
+>;
+
+function toAPIMounts(mounts?: SandboxMounts): SandboxMetaData["mounts"] {
+  if (mounts === undefined) return undefined;
+  return Object.fromEntries(
+    Object.entries(mounts).map(([path, mount]) => [
+      path,
+      {
+        drive: "mode" in mount ? mount.drive : mount.name,
+        mode: "mode" in mount ? mount.mode : "read-write",
+      },
+    ]),
+  );
+}
+
+/**
+ * A KCR image reference.
+ */
+export type SandboxImage = `khulnasoft/sandbox/${ManagedImage}` | (string & {});
+
+/**
+ * Sandbox environment selection options.
+ * @inline
+ */
+export type RuntimeOrImage =
+  | {
+      /**
+       * A legacy Khulnasoft-managed runtime.
+       *
+       * @deprecated Use `image` instead.
+       */
+      runtime?: RUNTIMES | (string & {});
+      image?: never;
+    }
+  | {
+      runtime?: never;
+      /**
+       * A Khulnasoft Container Registry (KCR) image to start the sandbox from,
+       * scoped to the sandbox's project or a shared image from any project. Accepts a repository name, an
+       * optional tag or digest, or a fully-qualified KCR URL. A bare
+       * repository name resolves to the `latest` tag. If omitted, the sandbox
+       * uses `khulnasoft/sandbox/universal:latest`.
+       *
+       * @example "khulnasoft/sandbox/universal" // Khulnasoft managed image, latest tag
+       * @example "my-repo" // latest tag
+       * @example "my-repo:v1" // specific tag
+       * @example "my-repo@sha256:..." // specific digest
+       * @example "other-team/other-project/repo:v1" // Shared image from another team
+       * @example "kcr.khulnasoft.com/my-team/my-project/repo:v1" // fully-qualified
+       */
+      image?: SandboxImage;
+    };
+
+export type CreateSandboxParams =
+  | (BaseCreateSandboxParams & RuntimeOrImage)
+  | (Omit<BaseCreateSandboxParams, "source"> & {
+      source: { type: "snapshot"; snapshotId: string };
+      // A snapshot already defines its base environment.
+      runtime?: never;
+      image?: never;
+    });
+
+/**
+ * Parameters for {@link Sandbox.fork}.
+ *
+ * The fork inherits the source sandbox's current filesystem snapshot and the
+ * server copies its config — resources, timeout, ports, tags, network policy,
+ * image, persistence, snapshot settings, and environment variables. Any field
+ * set here acts as an override of the copied value. When the source has no
+ * snapshot, its base environment is copied.
+ *
+ * Drive mounts are not inherited: set `mounts` to attach drives to the fork.
+ * @inline
+ */
+export type ForkSandboxParams = Omit<BaseCreateSandboxParams, "source"> & {
+  /**
+   * Name of the source sandbox to fork from.
+   */
+  sourceSandbox: string;
+  /**
+   * A Khulnasoft Container Registry (KCR) image to start the fork from, overriding
+   * the image copied from the source.
+   */
+  image?: SandboxImage;
+};
+
+/** @inline */
+interface GetSandboxParams {
+  /**
+   * The name of the sandbox.
+   */
+  name: string;
+  /**
+   * Whether to resume an existing session immediately. Defaults to false;
+   * a persistent sandbox still auto-resumes on the first SDK call that
+   * needs a running session (such as `runCommand`).
+   */
+  resume?: boolean;
+  /**
+   * An AbortSignal to cancel the operation.
+   */
+  signal?: AbortSignal;
+  /**
+   * Called when the sandbox session is resumed (e.g., after a snapshot restore).
+   * Use this to re-warm caches, restore transient state, or run other setup logic.
+   */
+  onResume?: (sandbox: Sandbox) => Promise<void>;
+}
+
+/**
+ * Combines {@link CreateSandboxParams} with get-specific options so that any
+ * new parameter added to either flow is picked up automatically.
+ * @inline
+ */
+type GetOrCreateSandboxParams = CreateSandboxParams & {
+  /**
+   * Whether to resume an existing session immediately. Defaults to false;
+   * a persistent sandbox still auto-resumes on the first SDK call that
+   * needs a running session (such as `runCommand`).
+   */
+  resume?: boolean;
+  /**
+   * Called once after a sandbox is freshly created (not when an existing
+   * sandbox is retrieved). Use this for one-time setup such as seeding
+   * files or warming caches. The returned promise is awaited before
+   * {@link Sandbox.getOrCreate} resolves.
+   */
+  onCreate?: (sandbox: Sandbox) => Promise<void>;
+};
+
+function isSandboxStoppedError(err: unknown): boolean {
+  return err instanceof APIError && err.response.status === 410;
+}
+
+function isNotFoundError(err: unknown): boolean {
+  return err instanceof APIError && err.response.status === 404;
+}
+
+function isSnapshotNotFoundError(err: unknown): boolean {
+  return (
+    err instanceof APIError &&
+    err.response.status === 410 &&
+    (err.json as any)?.error?.code === "snapshot_not_found"
+  );
+}
+
+function isSandboxStoppingError(err: unknown): boolean {
+  return (
+    err instanceof APIError &&
+    err.response.status === 422 &&
+    (err.json as any)?.error?.code === "sandbox_stopping"
+  );
+}
+
+function isSandboxSnapshottingError(err: unknown): boolean {
+  return (
+    err instanceof APIError &&
+    err.response.status === 422 &&
+    (err.json as any)?.error?.code === "sandbox_snapshotting"
+  );
+}
+
+/**
+ * Serialized representation of a Sandbox for @workflow/serde.
+ * Fields `metadata` and `routes` are the original wire format from main.
+ * Fields `sandboxMetadata` and `projectId` are added for named-sandboxes.
+ */
+export interface SerializedSandbox {
+  metadata: SandboxSnapshot;
+  routes: SandboxRouteData[];
+  sandboxMetadata?: SandboxMetaData;
+  projectId?: string;
+}
+
+// ============================================================================
+// Sandbox class
+// ============================================================================
+
+/**
+ * A Sandbox is a persistent, isolated Linux MicroVMs to run commands in.
+ * Use {@link Sandbox.create} or {@link Sandbox.get} to construct.
+ * @hideconstructor
+ */
+export class Sandbox implements ExecutionContext {
+  private _client: APIClient | null = null;
+  private readonly projectId: string;
+
+  /**
+   * In-flight resume promise, used to deduplicate concurrent resume calls.
+   */
+  private resumePromise: Promise<void> | null = null;
+
+  /**
+   * Internal Session instance for the current VM.
+   */
+  private session: Session | undefined;
+
+  /**
+   * Internal metadata about the sandbox.
+   */
+  private sandbox: SandboxMetaData;
+
+  /**
+   * Hook that will be executed when a new session is created during resume.
+   */
+  private readonly onResume?: (sandbox: Sandbox) => Promise<void>;
+
+  /**
+   * Memoized lookup of the sandbox's default user and its primary group.
+   * See {@link Sandbox.getDefaultUser}.
+   */
+  private defaultUserPromise?: Promise<{ username: string; group: string }>;
+
+  /**
+   * A `node:fs/promises`-compatible API for interacting with the sandbox filesystem.
+   *
+   * @example
+   * const content = await sandbox.fs.readFile('/etc/hostname', 'utf8');
+   * await sandbox.fs.writeFile('/tmp/hello.txt', 'Hello, world!');
+   * const files = await sandbox.fs.readdir('/tmp');
+   * const stats = await sandbox.fs.stat('/tmp/hello.txt');
+   */
+  public readonly fs: FileSystem;
+
+  /**
+   * Lazily resolve credentials and construct an API client.
+   * @internal
+   */
+  private async ensureClient(): Promise<APIClient> {
+    "use step";
+    if (this._client) return this._client;
+    const credentials = await getCredentials();
+    this._client = new APIClient({
+      teamId: credentials.teamId,
+      token: credentials.token,
+    });
+    return this._client;
+  }
+
+  /**
+   * The name of this sandbox.
+   */
+  public get name(): string {
+    return this.sandbox.name;
+  }
+
+  /**
+   * Routes from ports to subdomains.
+   * @hidden
+   */
+  public get routes(): SandboxRouteData[] {
+    return this.currentSession().routes;
+  }
+
+  /**
+   * Whether the sandbox persists the state.
+   */
+  public get persistent(): boolean {
+    return this.sandbox.persistent;
+  }
+
+  /**
+   * The region this sandbox is configured to run in. Where the running session
+   * actually landed is reported by {@link Session.region}.
+   */
+  public get region(): string {
+    return this.sandbox.region ?? DEFAULT_SANDBOX_REGION;
+  }
+
+  /**
+   * The additional regions this sandbox can fail over to, in order. Empty when
+   * it does not fail over.
+   */
+  public get failoverRegions(): string[] {
+    return this.sandbox.failoverRegions ?? [];
+  }
+
+  /**
+   * Connect network ID for the target Secure Compute private network.
+   */
+  public get networkId(): string | undefined {
+    return this.sandbox.networkId;
+  }
+
+  /**
+   * Number of virtual CPUs allocated.
+   */
+  public get vcpus(): number | undefined {
+    return this.sandbox.vcpus;
+  }
+
+  /**
+   * Memory allocated in MB.
+   */
+  public get memory(): number | undefined {
+    return this.sandbox.memory;
+  }
+
+  /**
+   * Legacy runtime identifier, when the sandbox was created with `runtime`.
+   *
+   * @deprecated Use {@link Sandbox.image} for image-backed sandboxes.
+   */
+  public get runtime(): string | undefined {
+    return this.sandbox.runtime;
+  }
+
+  /**
+   * Digest-pinned reference of the container image the sandbox was created
+   * from, when it was created from an image (`"{repository}@{manifestDigest}"`).
+   */
+  public get image(): string | undefined {
+    return this.sandbox.image;
+  }
+
+  /**
+   * Cumulative egress bytes across all sessions.
+   */
+  public get totalEgressBytes(): number | undefined {
+    return this.sandbox.totalEgressBytes;
+  }
+
+  /**
+   * Cumulative ingress bytes across all sessions.
+   */
+  public get totalIngressBytes(): number | undefined {
+    return this.sandbox.totalIngressBytes;
+  }
+
+  /**
+   * Cumulative active CPU duration in milliseconds across all sessions.
+   */
+  public get totalActiveCpuDurationMs(): number | undefined {
+    return this.sandbox.totalActiveCpuDurationMs;
+  }
+
+  /**
+   * Cumulative wall-clock duration in milliseconds across all sessions.
+   */
+  public get totalDurationMs(): number | undefined {
+    return this.sandbox.totalDurationMs;
+  }
+
+  /**
+   * When this sandbox was last updated.
+   */
+  public get updatedAt(): Date {
+    return new Date(this.sandbox.updatedAt);
+  }
+
+  /**
+   * When the sandbox status was last updated.
+   */
+  public get statusUpdatedAt(): Date | undefined {
+    return this.sandbox.statusUpdatedAt
+      ? new Date(this.sandbox.statusUpdatedAt)
+      : undefined;
+  }
+
+  /**
+   * When this sandbox was created.
+   */
+  public get createdAt(): Date {
+    return new Date(this.sandbox.createdAt);
+  }
+
+  /**
+   * Interactive port.
+   */
+  public get interactivePort(): number | undefined {
+    return this.currentSession().interactivePort;
+  }
+
+  /**
+   * The default working directory of the current session (e.g.
+   * `/khulnasoft/sandbox`).
+   */
+  public get cwd(): string {
+    return this.currentSession().cwd;
+  }
+
+  /**
+   * The status of the current session.
+   */
+  public get status(): SessionMetaData["status"] {
+    return this.currentSession().status;
+  }
+
+  /**
+   * The default timeout of this sandbox in milliseconds.
+   */
+  public get timeout(): number | undefined {
+    return this.sandbox.timeout;
+  }
+
+  /**
+   * When the currently running session will time out.
+   */
+  public get expiresAt(): Date | undefined {
+    if (this.session?.status === "running") {
+      const base = this.session.startedAt ?? this.session.createdAt;
+      return new Date(base.getTime() + this.session.timeout);
+    }
+
+    return this.sandbox.expiresAt !== undefined
+      ? new Date(this.sandbox.expiresAt)
+      : undefined;
+  }
+
+  /**
+   * Key-value tags attached to the sandbox.
+   */
+  public get tags(): Record<string, string> | undefined {
+    return this.sandbox.tags;
+  }
+
+  /**
+   * Drives mounted on the sandbox, keyed by mount path.
+   */
+  public get mounts(): SandboxMetaData["mounts"] {
+    return this.sandbox.mounts;
+  }
+
+  /**
+   * The default network policy of this sandbox.
+   */
+  public get networkPolicy(): NetworkPolicy | undefined {
+    return this.sandbox.networkPolicy
+      ? fromAPINetworkPolicy(this.sandbox.networkPolicy)
+      : undefined;
+  }
+
+  /**
+   * If the session was created from a snapshot, the ID of that snapshot.
+   */
+  public get sourceSnapshotId(): string | undefined {
+    return this.currentSession().sourceSnapshotId;
+  }
+
+  /**
+   * The current snapshot ID of this sandbox, if any.
+   */
+  public get currentSnapshotId(): string | undefined {
+    return this.sandbox.currentSnapshotId;
+  }
+
+  /**
+   * The default snapshot expiration in milliseconds, if set.
+   */
+  public get snapshotExpiration(): number | undefined {
+    return this.sandbox.snapshotExpiration;
+  }
+
+  /**
+   * The snapshot retention policy (`keep-last-snapshots`) currently configured
+   * on this sandbox, if any.
+   */
+  public get keepLastSnapshots():
+    | { count: number; expiration?: number; deleteEvicted?: boolean }
+    | undefined {
+    return this.sandbox.keepLastSnapshots;
+  }
+
+  /**
+   * The amount of CPU used by the session. Only reported once the VM is stopped.
+   */
+  public get activeCpuUsageMs(): number | undefined {
+    return this.currentSession().activeCpuUsageMs;
+  }
+
+  /**
+   * The amount of network data used by the session. Only reported once the VM is stopped.
+   */
+  public get networkTransfer():
+    | { ingress: number; egress: number }
+    | undefined {
+    return this.currentSession().networkTransfer;
+  }
+
+  /**
+   * Allow to get a list of sandboxes for a team narrowed to the given params.
+   * It returns both the sandboxes and the pagination metadata to allow getting
+   * the next page of results.
+   *
+   * The returned object is async-iterable to auto-paginate through all pages:
+   *
+   * ```ts
+   * const result = await Sandbox.list({ namePrefix: "ci-" });
+   * for await (const sandbox of result) { ... }
+   * // or: await result.toArray();
+   * // or: for await (const page of result.pages()) { ... }
+   * ```
+   */
+  static async list<Tags extends Record<string, string>>(
+    params?: Partial<
+      Omit<Parameters<APIClient["listSandboxes"]>[0], "tags">
+    > & {
+      /**
+       * Filter sandboxes by tag. Only a single `{ key: value }` tag filter
+       * is currently supported.
+       * @example { env: "staging" }
+       */
+      tags?: Tags & SingleTagFilter<Tags>;
+    } & Partial<Credentials> &
+      WithFetchOptions,
+  ) {
+    "use step";
+    const credentials = await getCredentials(params);
+    const client = new APIClient({
+      teamId: credentials.teamId,
+      token: credentials.token,
+      fetch: params?.fetch,
+    });
+    const fetchPage = async (cursor?: string) => {
+      const response = await client.listSandboxes<Tags>({
+        ...credentials,
+        ...params,
+        ...(cursor !== undefined && { cursor }),
+      });
+      return response.json;
+    };
+    const firstPage = await fetchPage(params?.cursor);
+    return attachPaginator(firstPage, {
+      itemsKey: "sandboxes",
+      fetchNext: fetchPage,
+      signal: params?.signal,
+    });
+  }
+
+  /**
+   * Serialize a Sandbox instance to plain data for @workflow/serde.
+   *
+   * @param instance - The Sandbox instance to serialize
+   * @returns A plain object containing sandbox metadata and routes
+   */
+  static [WORKFLOW_SERIALIZE](instance: Sandbox): SerializedSandbox {
+    return {
+      metadata: instance.session?._sessionSnapshot!,
+      routes: instance.session?.routes ?? [],
+      sandboxMetadata: instance.sandbox,
+      projectId: instance.projectId,
+    };
+  }
+
+  /**
+   * Deserialize a Sandbox from serialized snapshot data.
+   *
+   * The deserialized instance uses the serialized metadata synchronously and
+   * lazily creates an API client only when methods perform API requests.
+   *
+   * @param data - The serialized sandbox data
+   * @returns The reconstructed Sandbox instance
+   */
+  static [WORKFLOW_DESERIALIZE](data: SerializedSandbox): Sandbox {
+    const sandbox = new Sandbox({
+      sandbox: data.sandboxMetadata!,
+      routes: data.routes,
+      projectId: data.projectId,
+    });
+    if (data.metadata) {
+      sandbox.session = new Session({
+        routes: data.routes,
+        snapshot: data.metadata,
+      });
+    }
+    return sandbox;
+  }
+
+  /**
+   * Create a new sandbox.
+   *
+   * By default, the sandbox uses `khulnasoft/sandbox/universal:latest`, an
+   * Ubuntu-based image with Node.js 24, Bun, Python 3.14, coding agents, and
+   * common development utilities.
+   *
+   * @param params - Creation parameters and optional credentials.
+   * @returns A promise resolving to the created {@link Sandbox}.
+   * @example
+   * <caption>Create a sandbox with default options</caption>
+   * const sandbox = await Sandbox.create();
+   *
+   * @example
+   * <caption>Create a sandbox and drop it in the end of the block</caption>
+   * async function fn() {
+   *   await using const sandbox = await Sandbox.create();
+   *   // Sandbox automatically stopped at the end of the lexical scope
+   * }
+   */
+  static async create(
+    params?: WithPrivate<
+      CreateSandboxParams | (CreateSandboxParams & Credentials)
+    > &
+      WithFetchOptions,
+  ): Promise<Sandbox & AsyncDisposable> {
+    "use step";
+    if (params?.runtime !== undefined && params.image !== undefined) {
+      throw new TypeError("`runtime` and `image` cannot be used together.");
+    }
+
+    const credentials = await getCredentials(params);
+    const client = new APIClient({
+      teamId: credentials.teamId,
+      token: credentials.token,
+      fetch: params?.fetch,
+    });
+
+    const privateParams = getPrivateParams(params);
+    const response = await client.createSandbox({
+      source: params?.source,
+      projectId: credentials.projectId,
+      ports: params?.ports ?? [],
+      timeout: params?.timeout,
+      resources: params?.resources,
+      runtime: params?.runtime,
+      image: params?.image,
+      networkPolicy: params?.networkPolicy,
+      networkId: params?.networkId,
+      env: params?.env,
+      tags: params?.tags,
+      mounts: toAPIMounts(params?.mounts),
+      snapshotExpiration: params?.snapshotExpiration,
+      keepLastSnapshots: params?.keepLastSnapshots,
+      region: params?.region,
+      failoverRegions: params?.failoverRegions,
+      signal: params?.signal,
+      name: params?.name,
+      persistent: params?.persistent,
+      ...privateParams,
+    });
+
+    return new DisposableSandbox({
+      client,
+      session: response.json.session,
+      sandbox: response.json.sandbox,
+      routes: response.json.routes,
+      projectId: credentials.projectId,
+      onResume: params?.onResume,
+    });
+  }
+
+  /**
+   * Fork an existing sandbox into a new one.
+   *
+   * The server restores the fork from the source's current snapshot (or its
+   * base environment when it has none) and copies its config — resources,
+   * timeout, ports, tags, network policy, image, persistence, snapshot
+   * settings, and environment variables. Any field passed in `params` overrides
+   * the copied value.
+   *
+   * @param params - Fork parameters and optional credentials.
+   *   `sourceSandbox` is the name of the source sandbox; everything else
+   *   acts as an override.
+   * @returns A promise resolving to the new {@link Sandbox}.
+   *
+   * @example
+   * <caption>Fork with all config copied from the source</caption>
+   * const fork = await Sandbox.fork({ sourceSandbox: "prod-agent" });
+   *
+   * @example
+   * <caption>Fork with an explicit new name and overridden vcpus</caption>
+   * const fork = await Sandbox.fork({
+   *   sourceSandbox: "prod-agent",
+   *   name: "forked-prod-agent",
+   *   resources: { vcpus: 4 },
+   * });
+   */
+  static async fork(
+    params: WithPrivate<ForkSandboxParams | (ForkSandboxParams & Credentials)> &
+      WithFetchOptions,
+  ): Promise<Sandbox & AsyncDisposable> {
+    "use step";
+    const credentials = await getCredentials(params);
+    const client = new APIClient({
+      teamId: credentials.teamId,
+      token: credentials.token,
+      fetch: params.fetch,
+    });
+
+    const privateParams = getPrivateParams(params);
+    const response = await client.forkSandbox({
+      sourceSandbox: params.sourceSandbox,
+      projectId: credentials.projectId,
+      name: params.name,
+      ports: params.ports,
+      timeout: params.timeout,
+      resources: params.resources,
+      image: params.image,
+      networkPolicy: params.networkPolicy,
+      networkId: params.networkId,
+      env: params.env,
+      mounts: toAPIMounts(params.mounts),
+      tags: params.tags,
+      snapshotExpiration: params.snapshotExpiration,
+      keepLastSnapshots: params.keepLastSnapshots,
+      region: params.region,
+      failoverRegions: params.failoverRegions,
+      persistent: params.persistent,
+      signal: params.signal,
+      ...privateParams,
+    });
+
+    return new DisposableSandbox({
+      client,
+      session: response.json.session,
+      sandbox: response.json.sandbox,
+      routes: response.json.routes,
+      projectId: credentials.projectId,
+      onResume: params.onResume,
+    });
+  }
+
+  /**
+   * Retrieve an existing sandbox and resume its session.
+   *
+   * @param params - Get parameters and optional credentials.
+   * @returns A promise resolving to the {@link Sandbox}.
+   */
+  static async get(
+    params: WithPrivate<GetSandboxParams | (GetSandboxParams & Credentials)> &
+      WithFetchOptions,
+  ): Promise<Sandbox> {
+    "use step";
+    const credentials = await getCredentials(params);
+    const client = new APIClient({
+      teamId: credentials.teamId,
+      token: credentials.token,
+      fetch: params.fetch,
+    });
+
+    const privateParams = getPrivateParams(params);
+    const response = await client.getSandbox({
+      name: params.name,
+      projectId: credentials.projectId,
+      resume: params.resume,
+      signal: params.signal,
+      ...privateParams,
+    });
+
+    const sandbox = new Sandbox({
+      client,
+      session: response.json.session,
+      sandbox: response.json.sandbox,
+      routes: response.json.routes,
+      projectId: credentials.projectId,
+      onResume: params.onResume,
+    });
+
+    if (response.json.resumed && params.onResume) {
+      await params.onResume(sandbox);
+    }
+
+    return sandbox;
+  }
+
+  /**
+   * Retrieve an existing named sandbox, or create a new one if none exists.
+   *
+   * If `name` is omitted, this always creates a new sandbox and fires
+   * `onCreate`. If `name` is provided, it first tries {@link Sandbox.get};
+   * on `not_found` it creates a new sandbox with that name; on
+   * `snapshot_not_found` it deletes the stale named sandbox and creates
+   * a fresh one with the same name.
+   *
+   * @param params - Get/create parameters plus an optional `onCreate` hook.
+   * @returns A promise resolving to the {@link Sandbox}.
+   *
+   * @example
+   * <caption>Idempotent named sandbox with one-time setup</caption>
+   * const sandbox = await Sandbox.getOrCreate({
+   *   name: "my-workspace",
+   *   onCreate: async (sbx) => {
+   *     await sbx.writeFiles([
+   *       { path: "README.md", content: Buffer.from("# Hello") },
+   *     ]);
+   *   },
+   * });
+   *
+   * @example
+   * <caption>Unnamed — always creates</caption>
+   * const sandbox = await Sandbox.getOrCreate({
+   *   onCreate: async (sbx) => {
+   *     await sbx.runCommand("npm", ["install"]);
+   *   },
+   * });
+   */
+  static async getOrCreate(
+    params?: WithPrivate<
+      GetOrCreateSandboxParams | (GetOrCreateSandboxParams & Credentials)
+    > &
+      WithFetchOptions,
+  ): Promise<Sandbox> {
+    "use step";
+    if (params?.runtime !== undefined && params.image !== undefined) {
+      throw new TypeError("`runtime` and `image` cannot be used together.");
+    }
+
+    // No name → always create, fire onCreate.
+    if (!params?.name) {
+      const sandbox = await Sandbox.create(params);
+      if (params?.onCreate) {
+        await params.onCreate(sandbox);
+      }
+      return sandbox;
+    }
+
+    try {
+      return await Sandbox.get(
+        params as unknown as Parameters<typeof Sandbox.get>[0],
+      );
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        // Sandbox does not exist: re-create it.
+        const sandbox = await Sandbox.create(params);
+        if (params.onCreate) {
+          await params.onCreate(sandbox);
+        }
+        return sandbox;
+      }
+
+      if (isSnapshotNotFoundError(err)) {
+        // Sandbox exists but the snapshot has expired. Delete it and create
+        // a new one.
+        const credentials = await getCredentials(params);
+        const client = new APIClient({
+          teamId: credentials.teamId,
+          token: credentials.token,
+          fetch: params.fetch,
+        });
+        const privateParams = getPrivateParams(params);
+        try {
+          await client.deleteSandbox({
+            name: params.name,
+            projectId: credentials.projectId,
+            signal: params.signal,
+            ...privateParams,
+          });
+        } catch (deleteErr) {
+          // Tolerate 404 — the named sandbox was already cleaned up by a
+          // concurrent request. Propagate anything else.
+          if (!isNotFoundError(deleteErr)) {
+            throw deleteErr;
+          }
+        }
+
+        const sandbox = await Sandbox.create(params);
+        if (params.onCreate) {
+          await params.onCreate(sandbox);
+        }
+        return sandbox;
+      }
+
+      throw err;
+    }
+  }
+
+  /**
+   * Create a new Sandbox instance.
+   *
+   * @param params.client - Optional API client. If not provided, will be lazily created using global credentials.
+   * @param params.routes - Port-to-subdomain mappings for exposed ports
+   * @param params.sandbox - Sandbox snapshot metadata
+   */
+  constructor({
+    client,
+    routes,
+    session,
+    sandbox,
+    projectId,
+    onResume,
+  }: {
+    client?: APIClient;
+    routes: SandboxRouteData[];
+    session?: SessionMetaData;
+    sandbox: SandboxMetaData;
+    projectId?: string;
+    onResume?: (sandbox: Sandbox) => Promise<void>;
+  }) {
+    this._client = client ?? null;
+    if (session) {
+      this.session = new Session({ client: client!, routes, session });
+    }
+    this.sandbox = sandbox;
+    this.projectId = projectId ?? "";
+    this.onResume = onResume;
+    this.fs = new FileSystem(this);
+  }
+
+  /**
+   * Get the current session (the running VM) for this sandbox.
+   *
+   * @returns The {@link Session} instance.
+   */
+  currentSession(): Session {
+    if (!this.session) {
+      throw new Error("No active session. Run a command or call resume first.");
+    }
+    return this.session;
+  }
+
+  /**
+   * Resume this sandbox by creating a new session via `getSandbox`.
+   */
+  private async resume(signal?: AbortSignal): Promise<void> {
+    if (!this.resumePromise) {
+      this.resumePromise = this.doResume(signal).finally(() => {
+        this.resumePromise = null;
+      });
+    }
+    return this.resumePromise;
+  }
+
+  private async doResume(signal?: AbortSignal): Promise<void> {
+    const client = await this.ensureClient();
+    const response = await client.getSandbox({
+      name: this.sandbox.name,
+      projectId: this.projectId,
+      resume: true,
+      signal,
+    });
+    this.session = new Session({
+      client,
+      routes: response.json.routes,
+      session: response.json.session,
+    });
+    if (this.onResume && response.json.resumed) {
+      await this.onResume(this);
+    }
+  }
+
+  /**
+   * Execute `fn`, and if the session is stopped/stopping/snapshotting, resume and retry.
+   */
+  private async withResume<T>(
+    fn: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!this.session) {
+      await this.resume(signal);
+    }
+    try {
+      return await fn();
+    } catch (err) {
+      if (
+        isSandboxStoppedError(err) ||
+        isSandboxStoppingError(err) ||
+        isSandboxSnapshottingError(err)
+      ) {
+        await this.resume(signal);
+        return fn();
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Start executing a command in this sandbox.
+   *
+   * @param command - The command to execute.
+   * @param args - Arguments to pass to the command.
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the command execution.
+   * @param opts.timeoutMs - Maximum time in milliseconds to wait for the
+   * command to complete. On expiry the process is killed with SIGKILL.
+   * @returns A {@link CommandFinished} result once execution is done.
+   */
+  async runCommand(
+    command: string,
+    args?: string[],
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<CommandFinished>;
+  /**
+   * Start executing a command in detached mode.
+   *
+   * @param params - The command parameters.
+   * @returns A {@link Command} instance for the running command.
+   */
+  async runCommand(
+    params: RunCommandParams & { detached: true },
+  ): Promise<Command>;
+
+  /**
+   * Start executing a command in this sandbox.
+   *
+   * @param params - The command parameters.
+   * @returns A {@link CommandFinished} result once execution is done.
+   */
+
+  async runCommand(params: RunCommandParams): Promise<CommandFinished>;
+
+  async runCommand(
+    commandOrParams: string | RunCommandParams,
+    args?: string[],
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<Command | CommandFinished> {
+    "use step";
+    const signal =
+      typeof commandOrParams === "string"
+        ? opts?.signal
+        : commandOrParams.signal;
+    return this.withResume(
+      () => this.session!.runCommand(commandOrParams as any, args, opts),
+      signal,
+    );
+  }
+
+  /**
+   * Internal helper to start a command in the sandbox.
+   *
+   * @param params - Command execution parameters.
+   * @returns A {@link Command} or {@link CommandFinished}, depending on `detached`.
+   * @internal
+   */
+  async getCommand(
+    cmdId: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Command> {
+    "use step";
+    return this.withResume(
+      () => this.session!.getCommand(cmdId, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Create a directory in the filesystem of this sandbox.
+   *
+   * @param path - Path of the directory to create
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   */
+  async mkDir(path: string, opts?: { signal?: AbortSignal }): Promise<void> {
+    "use step";
+    return this.withResume(() => this.session!.mkDir(path, opts), opts?.signal);
+  }
+
+  /**
+   * Open an interactive shell session, resuming the sandbox if needed.
+   *
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns The WebSocket URL and token used to connect to the PTY.
+   */
+  async openInteractive(opts?: {
+    signal?: AbortSignal;
+  }): Promise<{ url: string; token: string }> {
+    "use step";
+    return this.withResume(
+      () => this.session!.openInteractive(opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Read a file from the filesystem of this sandbox as a stream.
+   *
+   * @param file - File to read, with path and optional cwd
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves to a ReadableStream containing the file contents, or null if file not found
+   */
+  async readFile(
+    file: { path: string; cwd?: string },
+    opts?: { signal?: AbortSignal },
+  ): Promise<NodeJS.ReadableStream | null> {
+    "use step";
+    return this.withResume(
+      () => this.session!.readFile(file, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Read a file from the filesystem of this sandbox as a Buffer.
+   *
+   * @param file - File to read, with path and optional cwd
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves to the file contents as a Buffer, or null if file not found
+   */
+  async readFileToBuffer(
+    file: { path: string; cwd?: string },
+    opts?: { signal?: AbortSignal },
+  ): Promise<Buffer | null> {
+    "use step";
+    return this.withResume(
+      () => this.session!.readFileToBuffer(file, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Download a file from the sandbox to the local filesystem.
+   *
+   * @param src - Source file on the sandbox, with path and optional cwd
+   * @param dst - Destination file on the local machine, with path and optional cwd
+   * @param opts - Optional parameters.
+   * @param opts.mkdirRecursive - If true, create parent directories for the destination if they don't exist.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns The absolute path to the written file, or null if the source file was not found
+   */
+  async downloadFile(
+    src: { path: string; cwd?: string },
+    dst: { path: string; cwd?: string },
+    opts?: { mkdirRecursive?: boolean; signal?: AbortSignal },
+  ): Promise<string | null> {
+    "use step";
+    return this.withResume(
+      () => this.session!.downloadFile(src, dst, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Write files to the filesystem of this sandbox.
+   * Defaults to writing to /khulnasoft/sandbox unless an absolute path is specified.
+   * Writes files using the sandbox's default user.
+   *
+   * @param files - Array of files with path, content, and optional mode (permissions)
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves when the files are written
+   *
+   * @example
+   * // Write an executable script
+   * await sandbox.writeFiles([
+   *   { path: "/usr/local/bin/myscript", content: "#!/bin/bash\necho hello", mode: 0o755 }
+   * ]);
+   */
+  async writeFiles(
+    files: {
+      path: string;
+      content: string | Uint8Array;
+      mode?: number;
+    }[],
+    opts?: { signal?: AbortSignal },
+  ) {
+    "use step";
+    return this.withResume(
+      () => this.session!.writeFiles(files, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * Get the public domain of a port of this sandbox.
+   *
+   * @param p - Port number to resolve
+   * @returns A full domain (e.g. `https://subdomain.khulnasoft.run`)
+   * @throws If the port has no associated route
+   */
+  domain(p: number): string {
+    return this.currentSession().domain(p);
+  }
+
+  /**
+   * Stop the sandbox.
+   *
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns The final session state after stopping, with optional snapshot metadata.
+   */
+  async stop(opts?: {
+    signal?: AbortSignal;
+  }): Promise<SandboxSnapshot & { snapshot?: SnapshotMetadata }> {
+    "use step";
+    if (!this.session) {
+      throw new Error("No active session to stop.");
+    }
+    const { session, sandbox, snapshot } = await this.session.stop(opts);
+    if (sandbox) {
+      this.sandbox = sandbox;
+    }
+    return Object.assign(session, { snapshot });
+  }
+
+  /**
+   * Update the network policy for this sandbox.
+   *
+   * @deprecated Use {@link Sandbox.update} instead.
+   *
+   * @param networkPolicy - The new network policy to apply.
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves when the network policy is updated.
+   *
+   * @example
+   * // Restrict to specific domains
+   * await sandbox.updateNetworkPolicy({
+   *   allow: ["*.npmjs.org", "github.com"],
+   * });
+   *
+   * @example
+   * // Inject credentials with per-domain transformers
+   * await sandbox.updateNetworkPolicy({
+   *   allow: {
+   *     "ai-gateway.khulnasoft.sh": [{
+   *       transform: [{
+   *         headers: { authorization: "Bearer ..." }
+   *       }]
+   *     }],
+   *     "*": []
+   *   }
+   * });
+   *
+   * @example
+   * // Deny all network access
+   * await sandbox.updateNetworkPolicy("deny-all");
+   */
+  async updateNetworkPolicy(
+    networkPolicy: NetworkPolicy,
+    opts?: { signal?: AbortSignal },
+  ): Promise<NetworkPolicy> {
+    "use step";
+    await this.withResume(
+      () => this.session!.update({ networkPolicy: networkPolicy }, opts),
+      opts?.signal,
+    );
+
+    return this.session!.networkPolicy!;
+  }
+
+  /**
+   * Extend the timeout of the sandbox by the specified duration.
+   *
+   * This allows you to extend the lifetime of a sandbox up until the maximum
+   * execution timeout for your plan.
+   *
+   * @param duration - The duration in milliseconds to extend the timeout by
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves when the timeout is extended
+   *
+   * @example
+   * const sandbox = await Sandbox.create({ timeout: ms('10m') });
+   * // Extends timeout by 5 minutes, to a total of 15 minutes.
+   * await sandbox.extendTimeout(ms('5m'));
+   */
+  async extendTimeout(
+    duration: number,
+    opts?: { signal?: AbortSignal },
+  ): Promise<void> {
+    "use step";
+    return this.withResume(
+      () => this.session!.extendTimeout(duration, opts),
+      opts?.signal,
+    );
+  }
+
+  /**
+   * The user that non-`sudo` commands and the HTTP file API run as, together
+   * with that user's primary group. This depends on the sandbox image. The
+   * multi-user helpers group-own home and shared directories by this user's
+   * group so the file API can traverse them, so we resolve it from the running
+   * sandbox rather than assuming a fixed name.
+   *
+   * The result is memoized for the lifetime of this instance.
+   *
+   * @internal
+   */
+  getDefaultUser(opts?: {
+    signal?: AbortSignal;
+  }): Promise<{ username: string; group: string }> {
+    if (!this.defaultUserPromise) {
+      this.defaultUserPromise = this.resolveDefaultUser(opts).catch((err) => {
+        // Don't cache failures — allow a later call to retry.
+        this.defaultUserPromise = undefined;
+        throw err;
+      });
+    }
+    return this.defaultUserPromise;
+  }
+
+  private async resolveDefaultUser(opts?: {
+    signal?: AbortSignal;
+  }): Promise<{ username: string; group: string }> {
+    const result = await this.runCommand({
+      cmd: "sh",
+      args: ["-c", "id -un; id -gn"],
+      signal: opts?.signal,
+    });
+    if (result.exitCode !== 0) {
+      const stderr = await result.stderr();
+      throw new Error(`Failed to resolve the default sandbox user: ${stderr}`);
+    }
+    const [username, group] = (await result.stdout()).trim().split("\n");
+    if (!username || !group) {
+      throw new Error(
+        `Failed to resolve the default sandbox user (got "${username}:${group}")`,
+      );
+    }
+    return { username, group };
+  }
+
+  /**
+   * Create a new Linux user in this sandbox with an isolated home directory.
+   *
+   * The home directory is group-owned by the sandbox's default user group with
+   * `770` permissions, so the SDK's HTTP file API can read/write directly.
+   * Other users cannot access this user's home directory since they are not in
+   * that group.
+   *
+   * @param username - Linux username (lowercase letters, digits, hyphens, underscores)
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A {@link SandboxUser} instance for the created user.
+   *
+   * @example
+   * const alice = await sandbox.createUser("alice");
+   * await alice.runCommand("whoami"); // "alice"
+   * await alice.writeFiles([{ path: "hello.txt", content: Buffer.from("hi") }]);
+   */
+  async createUser(
+    username: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<SandboxUser> {
+    validateName(username, "username");
+
+    const { group: defaultGroup } = await this.getDefaultUser(opts);
+
+    // Create user with home directory and default shell
+    const useradd = await this.runCommand({
+      cmd: "useradd",
+      args: ["-m", "-s", "/bin/bash", username],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (useradd.exitCode !== 0) {
+      // useradd reserves exit code 9 for an already-taken username. Expose
+      // that expected race separately without masking provisioning failures.
+      if (useradd.exitCode === 9) {
+        throw new SandboxUserAlreadyExistsError(username);
+      }
+      const stderr = await useradd.stderr();
+      throw new Error(`Failed to create user "${username}": ${stderr}`);
+    }
+
+    // Group-own the home directory by the default user's group so the HTTP
+    // file API (which runs as that user) can read/write directly.
+    const chown = await this.runCommand({
+      cmd: "chown",
+      args: [`${username}:${defaultGroup}`, `/home/${username}`],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (chown.exitCode !== 0) {
+      const stderr = await chown.stderr();
+      throw new Error(
+        `Failed to set ownership on /home/${username}: ${stderr}`,
+      );
+    }
+
+    // Set home directory permissions: owner full, group (the default user's
+    // group) read+write+execute, others none. Other users can't access
+    // because they are not in that group.
+    const chmod = await this.runCommand({
+      cmd: "chmod",
+      args: ["770", `/home/${username}`],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (chmod.exitCode !== 0) {
+      const stderr = await chmod.stderr();
+      throw new Error(
+        `Failed to set permissions on /home/${username}: ${stderr}`,
+      );
+    }
+
+    return new SandboxUser({ sandbox: this, username });
+  }
+
+  /**
+   * Get a user handle without creating the user.
+   * Assumes the user already exists in the sandbox.
+   *
+   * @param username - Linux username
+   * @returns A {@link SandboxUser} instance.
+   *
+   * @example
+   * const root = sandbox.asUser("root");
+   * await root.runCommand("whoami"); // "root"
+   */
+  asUser(username: "root" | (string & {})): SandboxUser {
+    validateName(username, "username");
+    return new SandboxUser({ sandbox: this, username });
+  }
+
+  /**
+   * Create a new Linux group with a shared directory.
+   *
+   * Creates a shared directory at `/shared/<groupname>` with setgid permissions
+   * (`2770`), so files created inside it automatically inherit the group.
+   * All group members can read and write files in the shared directory.
+   *
+   * @param groupname - Group name (lowercase letters, digits, hyphens, underscores)
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns An object with the group name and shared directory path.
+   *
+   * @example
+   * const devs = await sandbox.createGroup("devs");
+   * console.log(devs.sharedDir); // "/shared/devs"
+   * await sandbox.addUserToGroup("alice", "devs");
+   */
+  async createGroup(
+    groupname: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{ groupname: string; sharedDir: string }> {
+    validateName(groupname, "group name");
+
+    const { username: defaultUser } = await this.getDefaultUser(opts);
+
+    const sharedDir = `/shared/${groupname}`;
+
+    // Create the group
+    const groupadd = await this.runCommand({
+      cmd: "groupadd",
+      args: [groupname],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (groupadd.exitCode !== 0) {
+      const stderr = await groupadd.stderr();
+      throw new Error(`Failed to create group "${groupname}": ${stderr}`);
+    }
+
+    // Create shared directory
+    const mkdirResult = await this.runCommand({
+      cmd: "mkdir",
+      args: ["-p", sharedDir],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (mkdirResult.exitCode !== 0) {
+      const stderr = await mkdirResult.stderr();
+      throw new Error(
+        `Failed to create shared directory ${sharedDir}: ${stderr}`,
+      );
+    }
+
+    // Set ownership: the default user (so the HTTP file API can write into the
+    // shared dir), group-owned by the new group.
+    const chown = await this.runCommand({
+      cmd: "chown",
+      args: [`${defaultUser}:${groupname}`, sharedDir],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (chown.exitCode !== 0) {
+      const stderr = await chown.stderr();
+      throw new Error(`Failed to set ownership on ${sharedDir}: ${stderr}`);
+    }
+
+    // Set permissions: setgid (2) + rwx for owner and group, none for others
+    const chmod = await this.runCommand({
+      cmd: "chmod",
+      args: ["2770", sharedDir],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (chmod.exitCode !== 0) {
+      const stderr = await chmod.stderr();
+      throw new Error(`Failed to set permissions on ${sharedDir}: ${stderr}`);
+    }
+
+    return { groupname, sharedDir };
+  }
+
+  /**
+   * Add a user to a group.
+   *
+   * After joining, the user can read and write files in the group's
+   * shared directory at `/shared/<groupname>`.
+   *
+   * @param username - The user to add
+   * @param groupname - The group to add the user to
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   *
+   * @example
+   * await sandbox.addUserToGroup("alice", "devs");
+   */
+  async addUserToGroup(
+    username: string,
+    groupname: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<void> {
+    validateName(username, "username");
+    validateName(groupname, "group name");
+
+    const result = await this.runCommand({
+      cmd: "usermod",
+      args: ["-aG", groupname, username],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (result.exitCode !== 0) {
+      const stderr = await result.stderr();
+      throw new Error(
+        `Failed to add "${username}" to group "${groupname}": ${stderr}`,
+      );
+    }
+  }
+
+  /**
+   * Remove a user from a group.
+   *
+   * @param username - The user to remove
+   * @param groupname - The group to remove the user from
+   * @param opts - Optional parameters.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   *
+   * @example
+   * await sandbox.removeUserFromGroup("alice", "devs");
+   */
+  async removeUserFromGroup(
+    username: string,
+    groupname: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<void> {
+    validateName(username, "username");
+    validateName(groupname, "group name");
+
+    const result = await this.runCommand({
+      cmd: "gpasswd",
+      args: ["-d", username, groupname],
+      sudo: true,
+      signal: opts?.signal,
+    });
+    if (result.exitCode !== 0) {
+      const stderr = await result.stderr();
+      throw new Error(
+        `Failed to remove "${username}" from group "${groupname}": ${stderr}`,
+      );
+    }
+  }
+
+  /**
+   * Create a snapshot from this currently running sandbox. New sandboxes can
+   * then be created from this snapshot using {@link Sandbox.createFromSnapshot}.
+   *
+   * Note: this sandbox will be stopped as part of the snapshot creation process.
+   *
+   * @param opts - Optional parameters.
+   * @param opts.expiration - Optional expiration time in milliseconds. Use 0 for no expiration at all.
+   * @param opts.signal - An AbortSignal to cancel the operation.
+   * @returns A promise that resolves to the Snapshot instance
+   */
+  async snapshot(opts?: {
+    expiration?: number;
+    signal?: AbortSignal;
+  }): Promise<Snapshot> {
+    "use step";
+    return this.withResume(() => this.session!.snapshot(opts), opts?.signal);
+  }
+
+  /**
+   * Update the sandbox configuration.
+   *
+   * When `ports` is provided, it is treated as the full desired port list:
+   * any currently exposed port omitted from the array will be deregistered.
+   *
+   * When `timeout` is increased and a session is currently running, the running
+   * session's deadline is also extended.
+   *
+   * `region` and `failoverRegions` apply to the next session; the currently
+   * running session keeps the region it started in. Pass an empty
+   * `failoverRegions` array to remove all failover regions.
+   *
+   * When `mounts` is provided, it replaces all current mounts and applies to
+   * the next session. Pass an empty object to remove all mounts.
+   *
+   * @param params - Fields to update.
+   * @param opts - Optional abort signal.
+   */
+  async update(
+    params: {
+      persistent?: boolean;
+      resources?: { vcpus?: number };
+      timeout?: number;
+      networkPolicy?: NetworkPolicy;
+      /** Set to `null` to remove the sandbox from Secure Compute. */
+      networkId?: string | null;
+      tags?: Record<string, string>;
+      ports?: number[];
+      snapshotExpiration?: number;
+      keepLastSnapshots?: {
+        count: number;
+        expiration?: number;
+        deleteEvicted?: boolean;
+      } | null;
+      currentSnapshotId?: string;
+      region?: SandboxRegion;
+      failoverRegions?: SandboxRegion[];
+      mounts?: SandboxMounts;
+    },
+    opts?: { signal?: AbortSignal },
+  ): Promise<void> {
+    "use step";
+    const client = await this.ensureClient();
+    let resources: { vcpus: number; memory: number } | undefined;
+    if (params.resources?.vcpus) {
+      resources = {
+        vcpus: params.resources.vcpus,
+        memory: params.resources.vcpus * 2048,
+      };
+    }
+
+    // Update the sandbox config. This config will be used on the next session.
+    const response = await client.updateSandbox({
+      name: this.sandbox.name,
+      projectId: this.projectId,
+      persistent: params.persistent,
+      resources,
+      timeout: params.timeout,
+      networkPolicy: params.networkPolicy,
+      networkId: params.networkId,
+      tags: params.tags,
+      ports: params.ports,
+      snapshotExpiration: params.snapshotExpiration,
+      keepLastSnapshots: params.keepLastSnapshots,
+      currentSnapshotId: params.currentSnapshotId,
+      region: params.region,
+      failoverRegions: params.failoverRegions,
+      mounts: toAPIMounts(params.mounts),
+      signal: opts?.signal,
+    });
+    this.sandbox = response.json.sandbox;
+    if (params.ports !== undefined && response.json.routes) {
+      this.session?.updateRoutes(response.json.routes);
+    }
+
+    // Apply the new timeout to the currently running session (only if it is a
+    // positive increment).
+    if (params.timeout !== undefined && this.session?.status === "running") {
+      const increment = params.timeout - this.session.timeout;
+      if (increment > 0) {
+        try {
+          await this.session.extendTimeout(increment, opts);
+        } catch (err) {
+          if (!isSandboxStoppedError(err) && !isSandboxStoppingError(err)) {
+            throw err;
+          }
+        }
+      }
+    }
+
+    // Update the current session config. This only applies to network policy.
+    if (params.networkPolicy) {
+      try {
+        return await this.session?.update(
+          { networkPolicy: params.networkPolicy },
+          opts,
+        );
+      } catch (err) {
+        if (isSandboxStoppedError(err) || isSandboxStoppingError(err)) {
+          return;
+        }
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Delete this sandbox.
+   *
+   * After deletion the instance becomes inert — all further API calls will
+   * throw immediately.
+   *
+   * @param opts.deleteOrphanSnapshots - When true, the snapshots of this
+   * sandbox that are not used by any other sandbox are deleted asynchronously
+   * too. Defaults to false, which keeps them until they expire.
+   */
+  async delete(opts?: {
+    deleteOrphanSnapshots?: boolean;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    "use step";
+    const client = await this.ensureClient();
+    await client.deleteSandbox({
+      name: this.sandbox.name,
+      projectId: this.projectId,
+      deleteOrphanSnapshots: opts?.deleteOrphanSnapshots,
+      signal: opts?.signal,
+    });
+  }
+
+  /**
+   * List sessions (VMs) that have been created for this sandbox.
+   *
+   * @param params - Optional pagination parameters.
+   * @returns The list of sessions and pagination metadata.
+   */
+  async listSessions(params?: {
+    limit?: number;
+    cursor?: string;
+    sortOrder?: "asc" | "desc";
+    signal?: AbortSignal;
+  }) {
+    "use step";
+    const client = await this.ensureClient();
+    const fetchPage = async (cursor?: string) => {
+      const response = await client.listSessions({
+        projectId: this.projectId,
+        name: this.sandbox.name,
+        limit: params?.limit,
+        cursor,
+        sortOrder: params?.sortOrder,
+        signal: params?.signal,
+      });
+      return response.json;
+    };
+    const firstPage = await fetchPage(params?.cursor);
+    return attachPaginator(firstPage, {
+      itemsKey: "sessions",
+      fetchNext: fetchPage,
+      signal: params?.signal,
+    });
+  }
+
+  /**
+   * List snapshots that belong to this sandbox.
+   *
+   * @param params - Optional pagination parameters.
+   * @returns The list of snapshots and pagination metadata.
+   */
+  async listSnapshots(params?: {
+    limit?: number;
+    cursor?: string;
+    sortOrder?: "asc" | "desc";
+    signal?: AbortSignal;
+  }) {
+    "use step";
+    const client = await this.ensureClient();
+    const fetchPage = async (cursor?: string) => {
+      const response = await client.listSnapshots({
+        projectId: this.projectId,
+        name: this.sandbox.name,
+        limit: params?.limit,
+        cursor,
+        sortOrder: params?.sortOrder,
+        signal: params?.signal,
+      });
+      return response.json;
+    };
+    const firstPage = await fetchPage(params?.cursor);
+    return attachPaginator(firstPage, {
+      itemsKey: "snapshots",
+      fetchNext: fetchPage,
+      signal: params?.signal,
+    });
+  }
+}
+
+/**
+ * A {@link Sandbox} that can automatically be disposed using a `await using` statement.
+ *
+ * @example
+ * {
+ *   await using const sandbox = await Sandbox.create();
+ * }
+ * // Sandbox is automatically stopped here
+ */
+class DisposableSandbox extends Sandbox implements AsyncDisposable {
+  async [Symbol.asyncDispose]() {
+    await this.stop();
+  }
+}

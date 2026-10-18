@@ -1,0 +1,218 @@
+import { Sandbox } from "@khulnasoft/sandbox";
+import createDebugger from "debug";
+import retry from "async-retry";
+import { WebSocket } from "ws";
+import ora from "ora";
+import {
+  acquireRelease,
+  createAbortController,
+  defer,
+} from "../util/disposables";
+import chalk from "chalk";
+import { extendSandboxTimeoutPeriodically } from "./extend-sandbox-timeout";
+
+const debug = createDebugger("sandbox:interactive-shell");
+
+/**
+ * A default TERM value so applications like `vim` and `nano` work properly.
+ */
+const TERM = "xterm-256color";
+
+/**
+ * A custom prompt so interactive sessions show the Khulnasoft triangle and the
+ * working directory (e.g. `▲ /khulnasoft/sandbox/ `) instead of the shell's
+ * default prompt. The server passes this through to the shell verbatim.
+ *
+ * This is built from primitives every POSIX shell honors so it renders the
+ * same regardless of which shell a customer image ships as `/bin/sh`.
+ *
+ * The color escapes are wrapped in the raw readline "ignore" markers
+ * `\x01` (RL_PROMPT_START_IGNORE) and `\x02` (RL_PROMPT_END_IGNORE) — the
+ * same bytes that bash's `\[` / `\]` decode into. This lets bash's readline
+ * exclude the (zero-width) escape sequences from its prompt-width calculation
+ * so cursor positioning stays correct on long/wrapping lines and during line
+ * editing. In non-bash shells these are C0 control bytes that terminals treat
+ * as non-printing, so they don't affect rendering there.
+ */
+const PS1 = `▲ \x01\x1b[2m\x02$PWD/\x01\x1b[0m\x02 `;
+
+/**
+ * Starts an interactive shell session with a sandbox. The API hands us a
+ * WebSocket URL and token, and we tunnel stdin/stdout over it.
+ */
+export async function startInteractiveShell(options: {
+  sandbox: Sandbox;
+  cwd?: string;
+  execution: [string, ...string[]];
+  envVars: Record<string, string>;
+  sudo: boolean;
+  skipExtendingTimeout: boolean;
+}) {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+
+    process.stdin.removeAllListeners();
+    try {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stdin.unref();
+    } catch {
+      // Ignore errors restoring stdin.
+    }
+    cleaned = true;
+  };
+  process.once("beforeExit", cleanup);
+  using _cleanup = defer(cleanup);
+
+  using progress = acquireRelease(
+    () => ora({ discardStdin: false }).start(),
+    (s) => s.stop(),
+  );
+
+  debug("Opening interactive session...");
+  progress.text = "Opening interactive session...";
+  const { url, token } = await options.sandbox.openInteractive();
+
+  const [command, ...args] = options.execution;
+  const execution: [string, ...string[]] = options.sudo
+    ? ["sudo", command, ...args]
+    : [command, ...args];
+
+  debug("Connecting...");
+  progress.text = "Connecting...";
+
+  let client: WebSocket;
+  try {
+    // Wait for the websocket server to be ready
+    // to accept traffic. This is important for
+    // cross region connections because the sevrer
+    // will have been instructed to start, but may not
+    // be fully ready to accept connections yet.
+    const { hostname } = new URL(url);
+    await retry(
+      async (_, attempt) => {
+        debug("Validating server health... (attempt %d)", attempt);
+        const response = await fetch(`https://${hostname}/health`);
+        if (!response.ok) {
+          throw new Error(`Server health check failed: ${response.statusText}`);
+        }
+      },
+      {
+        onRetry: (error: unknown, attempt: number) => {
+          debug(
+            "Server health check failed: %s (attempt %d)",
+            (error as Error).message,
+            attempt,
+          );
+        },
+        retries: 5,
+        minTimeout: 100,
+        randomize: true,
+      },
+    );
+
+    client = new WebSocket(`${url}?token=${encodeURIComponent(token)}`);
+  } catch (e) {
+    console.error(
+      chalk.dim(`\n╰▶ connection to ▲ ${options.sandbox.name} failed.`),
+    );
+    process.exitCode = 1;
+    return;
+  }
+  using _client = defer(() => {
+    try {
+      client.close();
+    } catch {
+      // Ignore errors closing the socket.
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    client.once("open", () => resolve());
+    client.once("error", (err) => reject(err));
+  });
+  debug("connected to %s", url);
+  progress.text = "Connected successfully.";
+
+  client.send(
+    JSON.stringify({
+      type: "start",
+      command: execution[0],
+      args: execution.slice(1),
+      env: toEnvArray({ TERM, PS1, ...options.envVars }),
+      cwd: options.cwd ?? options.sandbox.cwd,
+      cols: process.stdout.columns,
+      rows: process.stdout.rows,
+    }),
+  );
+
+  progress.stop();
+
+  using extension = createAbortController("stopped extensions");
+  if (!options.skipExtendingTimeout) {
+    extendSandboxTimeoutPeriodically(options.sandbox, extension.signal).catch(
+      extension.ignoreInterruptions,
+    );
+  }
+
+  // server -> stdout (binary frames) and exit (text control frame).
+  client.on("message", (data: Buffer, isBinary: boolean) => {
+    if (isBinary) {
+      process.stdout.write(data);
+      return;
+    }
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === "exit") {
+        process.exitCode = typeof msg.code === "number" ? msg.code : undefined;
+      }
+    } catch {
+      // Non-JSON text frame; treat as output.
+      process.stdout.write(data);
+    }
+  });
+
+  // stdin -> server (binary frames).
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+  const onStdin = (chunk: Buffer) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(chunk);
+    }
+  };
+  process.stdin.on("data", onStdin);
+
+  const onResize = () => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    client.send(
+      JSON.stringify({
+        type: "resize",
+        cols: process.stdout.columns,
+        rows: process.stdout.rows,
+      }),
+    );
+  };
+  process.on("SIGWINCH", onResize);
+
+  await new Promise<void>((resolve, reject) => {
+    client.once("close", () => resolve());
+    client.once("error", (err) => reject(err));
+  });
+
+  extension.abort("client disconnected");
+  process.removeListener("SIGWINCH", onResize);
+  process.stdin.removeListener("data", onStdin);
+
+  console.error(
+    chalk.dim(`\n╰▶ connection to ▲ ${options.sandbox.name} closed.`),
+  );
+}
+
+function toEnvArray(env: Record<string, string>): string[] {
+  return Object.entries(env).map(([key, value]) => `${key}=${value}`);
+}

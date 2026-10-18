@@ -1,0 +1,210 @@
+import { describe, test, expect, vi, beforeEach } from "vitest";
+import * as cmd from "cmd-ts";
+
+const { mockGet, mockUpdate } = vi.hoisted(() => ({
+  mockGet: vi.fn(),
+  mockUpdate: vi.fn(),
+}));
+
+vi.mock("../../src/client", () => ({
+  sandboxClient: {
+    get: mockGet,
+    create: vi.fn(),
+    fork: vi.fn(),
+    list: vi.fn(),
+  },
+  snapshotClient: { get: vi.fn(), list: vi.fn(), tree: vi.fn() },
+}));
+
+vi.mock("@khulnasoft/oidc", () => ({
+  getKhulnasoftOidcToken: vi.fn(),
+  getKhulnasoftToken: vi.fn(),
+}));
+
+vi.mock("../../src/commands/login", () => ({
+  login: { handler: vi.fn() },
+}));
+
+const fakeSandbox = (overrides: Record<string, unknown> = {}) => ({
+  name: "my-sandbox",
+  region: "sfo1",
+  failoverRegions: ["iad1", "cle1"],
+  vcpus: 2,
+  timeout: 300_000,
+  persistent: true,
+  networkPolicy: "restricted",
+  networkId: "network_123",
+  interactivePort: 8443,
+  routes: [],
+  tags: undefined,
+  update: mockUpdate,
+  ...overrides,
+});
+
+describe("config command", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet.mockResolvedValue(fakeSandbox());
+    process.env.KHULNASOFT_AUTH_TOKEN = "tok";
+  });
+
+  test("region updates the sandbox region", async () => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "region",
+      "my-sandbox",
+      "cle1",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({ region: "cle1" });
+  });
+
+  test("failover-regions splits, trims, and de-duplicates the list", async () => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "failover-regions",
+      "my-sandbox",
+      "sfo1, iad1,sfo1",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({
+      failoverRegions: ["sfo1", "iad1"],
+    });
+  });
+
+  test("mounts sends the parsed mounts to the SDK", async () => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "mounts",
+      "my-sandbox",
+      "--mount=data:/mnt/data:snapshot",
+      "--mount=cache:/mnt/cache",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({
+      mounts: {
+        "/mnt/data": { drive: "data", mode: "snapshot" },
+        "/mnt/cache": { drive: "cache", mode: "read-write" },
+      },
+    });
+  });
+
+  test("mounts without --mount clears the mounts", async () => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "mounts",
+      "my-sandbox",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({ mounts: {} });
+  });
+
+  test('failover-regions "none" clears the failover regions', async () => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "failover-regions",
+      "my-sandbox",
+      "none",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({ failoverRegions: [] });
+  });
+
+  test.each([
+    ["network_456", "network_456"],
+    ["none", null],
+  ])("network-id updates with %s", async (value, networkId) => {
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "network-id",
+      "my-sandbox",
+      value,
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockUpdate).toHaveBeenCalledWith({ networkId });
+  });
+
+  test.each([
+    ["network_456", "network_456"],
+    ["none", null],
+  ])("config network command updates with %s", async (value, networkId) => {
+    const { app } = await import("../../src/app.ts");
+    await cmd.run(app({ withoutAuth: true }), [
+      "config",
+      "network",
+      "my-sandbox",
+      value,
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    expect(mockGet).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "my-sandbox",
+        teamId: "team",
+        projectId: "proj",
+      }),
+    );
+    expect(mockUpdate).toHaveBeenCalledWith({ networkId });
+  });
+
+  test("config network rejects an empty ID without updating", async () => {
+    const { app } = await import("../../src/app.ts");
+    await expect(
+      cmd.run(app({ withoutAuth: true }), [
+        "config",
+        "network",
+        "my-sandbox",
+        " ",
+        "--scope=team",
+        "--project=proj",
+      ]),
+    ).rejects.toThrow();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  test("list prints the region and the failover regions", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "list",
+      "my-sandbox",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    const output = log.mock.calls.map(([line]) => String(line)).join("\n");
+    expect(output).toContain("sfo1");
+    expect(output).toContain("iad1, cle1");
+    expect(output).toContain("network_123");
+    log.mockRestore();
+  });
+
+  test("list dashes empty failover regions", async () => {
+    mockGet.mockResolvedValue(fakeSandbox({ failoverRegions: [] }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { config } = await import("../../src/commands/config.ts");
+    await cmd.run(config, [
+      "list",
+      "my-sandbox",
+      "--scope=team",
+      "--project=proj",
+    ]);
+
+    const output = log.mock.calls.map(([line]) => String(line)).join("\n");
+    expect(output).toMatch(/Failover regions\s+-/);
+    log.mockRestore();
+  });
+});

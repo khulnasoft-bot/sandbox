@@ -1,0 +1,10 @@
+{
+  "outputDirectory": "public",
+  "redirects": [
+    {
+      "source": "/(.*)",
+      "destination": "https://khulnasoft.com/docs/khulbasoft-sandbox",
+      "permanent": true
+    }
+  ]
+}

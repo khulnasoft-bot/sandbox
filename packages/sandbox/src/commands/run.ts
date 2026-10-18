@@ -1,0 +1,85 @@
+import * as cmd from "cmd-ts";
+import { APIError, type Sandbox } from "@khulnasoft/sandbox";
+import * as Create from "./create";
+import * as Exec from "./exec";
+import { sandboxClient } from "../client";
+import { StyledError } from "../error";
+import { omit } from "../util/omit";
+
+const args = {
+  ...Create.args,
+  // `timeout` is omitted because it collides with Create's `--timeout`
+  // (sandbox lifetime).
+  ...omit(Exec.args, "sandbox", "timeout"),
+  removeAfterUse: cmd.flag({
+    long: "rm",
+    description: "Automatically remove the sandbox when the command exits.",
+  }),
+  stopAfterUse: cmd.flag({
+    long: "stop",
+    description: "Stop the sandbox when the command exits.",
+  }),
+} as const;
+
+export const run = cmd.command({
+  name: "run",
+  description: "Create and run a command in a sandbox",
+  args,
+  async handler({ removeAfterUse, stopAfterUse, ...rest }) {
+    if (removeAfterUse && stopAfterUse) {
+      throw new Error("--rm and --stop are mutually exclusive.");
+    }
+    if (rest.runtime !== undefined && rest.image !== undefined) {
+      throw new Error("--runtime and --image cannot be used together.");
+    }
+
+    let sandbox: Sandbox;
+
+    // Resume an existing sandbox or otherwise create it.
+    if (rest.name) {
+      try {
+        sandbox = await sandboxClient.get({
+          name: rest.name,
+          projectId: rest.scope.project,
+          teamId: rest.scope.team,
+          token: rest.scope.token,
+          resume: true,
+          __includeSystemRoutes: true,
+        });
+      } catch (error) {
+        if (
+          error instanceof StyledError &&
+          error.cause instanceof APIError &&
+          error.cause.response.status === 404
+        ) {
+          sandbox = await Create.create.handler({
+            ...rest,
+            agent: undefined,
+            nonPersistent: rest.nonPersistent || removeAfterUse,
+            __printConnectHint: false,
+          } as Parameters<typeof Create.create.handler>[0]);
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      sandbox = await Create.create.handler({
+        ...rest,
+        agent: undefined,
+        nonPersistent: rest.nonPersistent || removeAfterUse,
+        __printConnectHint: false,
+      } as Parameters<typeof Create.create.handler>[0]);
+    }
+
+    try {
+      await Exec.exec.handler({ ...rest, sandbox, timeout: undefined });
+    } finally {
+      if (removeAfterUse) {
+        await sandbox.delete();
+      }
+      if (stopAfterUse) {
+        await sandbox.stop();
+      }
+    }
+  },
+});
