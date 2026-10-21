@@ -6,6 +6,10 @@ on:
       - main
   pull_request:
 
+env:
+  TURBO_TOKEN: ${{ secrets.TURBOREPO_REMOTE_CACHING_TOKEN }}
+  TURBO_TEAM: khulnasoft-labs
+
 concurrency: 
   group: ${{ github.workflow }}-${{ github.ref }}
   # Cancel in progress if the workflow is a pull request
